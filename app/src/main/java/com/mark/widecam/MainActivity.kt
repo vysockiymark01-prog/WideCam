@@ -4,10 +4,12 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.PendingIntent
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -50,6 +52,7 @@ import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -57,9 +60,11 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.StatFs
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.service.quicksettings.TileService
 import android.util.Range
 import android.util.Size
 import android.view.GestureDetector
@@ -90,12 +95,14 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.ceil
+import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 /** Колесо зума: тянешь пальцем влево-вправо. */
@@ -237,6 +244,33 @@ class GridView(ctx: Context) : View(ctx) {
     }
 }
 
+/** Рамки кадрирования под соцсети и кино. */
+class GuideView(ctx: Context) : View(ctx) {
+    var mode = 0
+        set(v) { field = v; invalidate() }
+    var landscape = false
+    private val aspects = floatArrayOf(0f, 9f / 16f, 1f, 4f / 5f, 16f / 9f, 2.39f)
+    private val shade = Paint().apply { color = 0x99000000.toInt() }
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xCCFFFFFF.toInt(); style = Paint.Style.STROKE; strokeWidth = ctx.resources.displayMetrics.density
+    }
+
+    override fun onDraw(c: Canvas) {
+        if (mode <= 0 || mode >= aspects.size) return
+        val a0 = aspects[mode]
+        val a = if (landscape) 1f / a0 else a0
+        val w = width.toFloat(); val h = height.toFloat()
+        var rw = w; var rh = w / a
+        if (rh > h) { rh = h; rw = h * a }
+        val l = (w - rw) / 2; val t = (h - rh) / 2
+        c.drawRect(0f, 0f, w, t, shade)
+        c.drawRect(0f, t + rh, w, h, shade)
+        c.drawRect(0f, t, l, t + rh, shade)
+        c.drawRect(l + rw, t, w, t + rh, shade)
+        c.drawRect(l, t, l + rw, t + rh, stroke)
+    }
+}
+
 /** Уровень горизонта. */
 class LevelView(ctx: Context) : View(ctx) {
     var roll = 0f
@@ -361,6 +395,12 @@ class GlPipe {
     private var aTex = 0
     private var uST = 0
     private var uMVP = 0
+    private var uProf = 0
+    @Volatile var profile = 0
+    @Volatile var horizonDeg = 0f
+    @Volatile var frontCam = false
+    private val corr = FloatArray(16)
+    private val tmp = FloatArray(16)
     private val st = FloatArray(16)
     private val mvp = FloatArray(16)
     private val ident = FloatArray(16)
@@ -406,7 +446,7 @@ class GlPipe {
         camTexture.setOnFrameAvailableListener({ draw() }, handler)
 
         val vs = "attribute vec4 aPos;\nattribute vec4 aTex;\nuniform mat4 uST;\nuniform mat4 uMVP;\nvarying vec2 vTex;\nvoid main() {\n  gl_Position = uMVP * aPos;\n  vTex = (uST * aTex).xy;\n}\n"
-        val fs = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\nvarying vec2 vTex;\nuniform samplerExternalOES sTex;\nvoid main() {\n  gl_FragColor = texture2D(sTex, vTex);\n}\n"
+        val fs = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\nvarying vec2 vTex;\nuniform samplerExternalOES sTex;\nuniform int uProf;\nvec3 sat(vec3 c, float s) { float l = dot(c, vec3(0.299, 0.587, 0.114)); return mix(vec3(l), c, s); }\nvec3 con(vec3 c, float k) { return (c - 0.5) * k + 0.5; }\nvoid main() {\n  vec3 c = texture2D(sTex, vTex).rgb;\n  if (uProf == 1) { c = con(c, 0.78) + 0.03; c = sat(c, 0.8); }\n  else if (uProf == 2) { c = sat(c, 0.85); c = con(c, 1.12); float l = dot(c, vec3(0.299, 0.587, 0.114)); c += vec3(0.05, 0.0, -0.05) * (l - 0.5) * 2.0; }\n  else if (uProf == 3) { c = sat(c, 1.3); c = con(c, 1.08); }\n  else if (uProf == 4) { float l = dot(c, vec3(0.299, 0.587, 0.114)); c = con(vec3(l), 1.15); }\n  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);\n}\n"
         prog = GLES20.glCreateProgram()
         GLES20.glAttachShader(prog, shader(GLES20.GL_VERTEX_SHADER, vs))
         GLES20.glAttachShader(prog, shader(GLES20.GL_FRAGMENT_SHADER, fs))
@@ -415,6 +455,7 @@ class GlPipe {
         aTex = GLES20.glGetAttribLocation(prog, "aTex")
         uST = GLES20.glGetUniformLocation(prog, "uST")
         uMVP = GLES20.glGetUniformLocation(prog, "uMVP")
+        uProf = GLES20.glGetUniformLocation(prog, "uProf")
         android.opengl.Matrix.setIdentityM(ident, 0)
     }
 
@@ -431,6 +472,7 @@ class GlPipe {
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
         GLES20.glUniformMatrix4fv(uST, 1, false, st, 0)
         GLES20.glUniformMatrix4fv(uMVP, 1, false, m, 0)
+        GLES20.glUniform1i(uProf, profile)
         quad.position(0)
         GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, quad)
         GLES20.glEnableVertexAttribArray(aPos)
@@ -445,10 +487,11 @@ class GlPipe {
             EGL14.eglMakeCurrent(dpy, pbuf, pbuf, ctx)
             camTexture.updateTexImage()
             camTexture.getTransformMatrix(st)
+            computeCorr()
             if (prevSurf != EGL14.EGL_NO_SURFACE) {
                 EGL14.eglMakeCurrent(dpy, prevSurf, prevSurf, ctx)
                 GLES20.glViewport(0, 0, pw, ph)
-                quadDraw(ident)
+                quadDraw(corr)
                 EGL14.eglSwapBuffers(dpy, prevSurf)
             }
             if (encSurf != EGL14.EGL_NO_SURFACE) {
@@ -457,11 +500,27 @@ class GlPipe {
                 android.opengl.Matrix.setIdentityM(mvp, 0)
                 if (encMirror) android.opengl.Matrix.scaleM(mvp, 0, -1f, 1f, 1f)
                 android.opengl.Matrix.rotateM(mvp, 0, encRot, 0f, 0f, 1f)
-                quadDraw(mvp)
+                android.opengl.Matrix.multiplyMM(tmp, 0, mvp, 0, corr, 0)
+                quadDraw(tmp)
                 EGLExt.eglPresentationTimeANDROID(dpy, encSurf, System.nanoTime())
                 EGL14.eglSwapBuffers(dpy, encSurf)
             }
         } catch (_: Exception) {}
+    }
+
+    /** Блокировка горизонта: поворачиваем кадр против наклона и чуть приближаем, чтобы не было пустых углов. */
+    private fun computeCorr() {
+        android.opengl.Matrix.setIdentityM(corr, 0)
+        val t = horizonDeg
+        if (abs(t) < 0.05f || pw <= 0 || ph <= 0) return
+        val a = pw.toFloat() / ph
+        val th = Math.toRadians(abs(t).toDouble())
+        val ratio = max(a, 1f / a)
+        val s = (cos(th) + ratio * sin(th)).toFloat()
+        android.opengl.Matrix.scaleM(corr, 0, 1f / a, 1f, 1f)
+        android.opengl.Matrix.rotateM(corr, 0, if (frontCam) -t else t, 0f, 0f, 1f)
+        android.opengl.Matrix.scaleM(corr, 0, a, 1f, 1f)
+        android.opengl.Matrix.scaleM(corr, 0, s, s, 1f)
     }
 
     private fun drop(s: EGLSurface) {
@@ -534,6 +593,10 @@ class MainActivity : Activity() {
         "Выкл", "Правило третей", "Сетка 4×4", "Золотое сечение",
         "Золотая спираль", "Золотая спираль (зеркально)", "Трети + диагонали", "Центр"
     )
+    private val profileNames = listOf("Стандарт", "Плоский (под цветокоррекцию)", "Кино", "Яркий", "Ч/Б")
+    private val profileShort = listOf("стандарт", "плоский", "кино", "яркий", "Ч/Б")
+    private val guideNames = listOf("Выкл", "9:16 (Reels / Shorts)", "1:1", "4:5 (лента)", "16:9", "2.39:1 (кино)")
+    private val presetNames = listOf("Влог", "Кино", "Таймлапс", "Мой")
     private val bitrateNames = listOf("Эконом", "Стандарт", "Максимум")
     private val tlIntervals = floatArrayOf(0f, 0.5f, 1f, 2f, 5f)
     private val isoValues = intArrayOf(50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800,
@@ -577,6 +640,11 @@ class MainActivity : Activity() {
     private lateinit var evChip: TextView
     private lateinit var stabChip: TextView
     private lateinit var torchChip: TextView
+    private lateinit var profileChip: TextView
+    private lateinit var horizonChip: TextView
+    private lateinit var timerChip: TextView
+    private lateinit var guide: GuideView
+    private lateinit var countText: TextView
     private lateinit var settingsBtn: TextView
     private lateinit var wheel: ZoomWheel
     private lateinit var lensBar: LinearLayout
@@ -621,6 +689,11 @@ class MainActivity : Activity() {
     private var levelOn = true
     private var zebraOn = false
     private var histOn = false
+    private var profile = 0
+    private var horizonLock = false
+    private var timerSec = 0
+    private var counting = false
+    private var countLeft = 0
     private var resumed = false
     private var smoothRoll = 0f
 
@@ -656,6 +729,21 @@ class MainActivity : Activity() {
     private lateinit var orient: OrientationEventListener
     private val hideStatus = Runnable { statusText.visibility = View.GONE }
     private val lensRefresh = Runnable { renderLenses() }
+    private val countTask = object : Runnable {
+        override fun run() {
+            if (!counting) return
+            if (countLeft <= 0) {
+                counting = false
+                countText.visibility = View.GONE
+                bg.post { startRec() }
+                return
+            }
+            countText.text = countLeft.toString()
+            countText.visibility = View.VISIBLE
+            countLeft--
+            main.postDelayed(this, 1000)
+        }
+    }
     private val hideRing = Runnable { if (!aeAfLocked) ring.visibility = View.INVISIBLE }
 
     private val tick = object : Runnable {
@@ -713,6 +801,10 @@ class MainActivity : Activity() {
             val roll = Math.toDegrees(atan2(e.values[0].toDouble(), e.values[1].toDouble())).toFloat()
             smoothRoll = if (abs(roll - smoothRoll) > 180f) roll else smoothRoll * 0.8f + roll * 0.2f
             level.roll = smoothRoll
+            if (horizonLock) {
+                val base = (smoothRoll / 90f).roundToInt() * 90f
+                gl.horizonDeg = (smoothRoll - base).coerceIn(-25f, 25f)
+            }
         }
         override fun onAccuracyChanged(s: Sensor?, a: Int) {}
     }
@@ -747,6 +839,11 @@ class MainActivity : Activity() {
         camSurface = Surface(gl.camTexture)
         buildUi()
         grid.mode = prefs.getInt("grid", 0)
+        guide.mode = prefs.getInt("guide", 0)
+        profile = prefs.getInt("profile", 0).coerceIn(0, 4)
+        gl.profile = profile
+        horizonLock = prefs.getBoolean("horizon", false)
+        timerSec = prefs.getInt("timer", 0)
         orient = object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
                 if (o == ORIENTATION_UNKNOWN) return
@@ -856,6 +953,8 @@ class MainActivity : Activity() {
         previewBox.addView(zebra, FrameLayout.LayoutParams(MATCH, MATCH))
         grid = GridView(this)
         previewBox.addView(grid, FrameLayout.LayoutParams(MATCH, MATCH))
+        guide = GuideView(this)
+        previewBox.addView(guide, FrameLayout.LayoutParams(MATCH, MATCH))
         level = LevelView(this)
         previewBox.addView(level, FrameLayout.LayoutParams(MATCH, MATCH))
         ring = View(this).apply {
@@ -865,6 +964,11 @@ class MainActivity : Activity() {
             visibility = View.INVISIBLE
         }
         previewBox.addView(ring, FrameLayout.LayoutParams(dp(72), dp(72)))
+        countText = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = 96f; typeface = Typeface.DEFAULT_BOLD
+            setShadowLayer(12f, 0f, 0f, Color.BLACK); visibility = View.GONE
+        }
+        previewBox.addView(countText, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.CENTER))
         hist = HistView(this).apply { visibility = View.GONE }
         previewBox.addView(hist, FrameLayout.LayoutParams(dp(120), dp(56), Gravity.TOP or Gravity.START)
             .apply { topMargin = dp(10); leftMargin = dp(10) })
@@ -910,8 +1014,11 @@ class MainActivity : Activity() {
         evChip = chip().apply { setOnClickListener { pickEv() } }
         stabChip = chip().apply { setOnClickListener { toggleStab() } }
         torchChip = chip().apply { text = "Фонарь"; setOnClickListener { toggleTorch() } }
+        profileChip = chip().apply { setOnClickListener { pickProfile() } }
+        horizonChip = chip().apply { text = "Горизонт"; setOnClickListener { setHorizon(!horizonLock) } }
+        timerChip = chip().apply { setOnClickListener { cycleTimer() } }
         settingsBtn = chip().apply { text = "⚙"; textSize = 17f; setOnClickListener { showSettings() } }
-        listOf(resChip, fpsChip, isoChip, shutterChip, wbChip, evChip, stabChip, torchChip, settingsBtn)
+        listOf(resChip, fpsChip, isoChip, shutterChip, wbChip, evChip, profileChip, stabChip, horizonChip, timerChip, torchChip, settingsBtn)
             .forEachIndexed { i, v -> row.addView(v, lp(WRAP, WRAP).apply { if (i > 0) leftMargin = dp(8) }) }
         val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
         scroll.addView(row, FrameLayout.LayoutParams(WRAP, MATCH))
@@ -1022,6 +1129,8 @@ class MainActivity : Activity() {
     /** Поворачиваем круглые кнопки вслед за телефоном. */
     private fun rotateUi(r: Int) = ui {
         val deg = uiDeg(r)
+        guide.landscape = r == 90 || r == 270
+        guide.invalidate()
         val views = mutableListOf<View>(settingsBtn, pauseBtn, galleryBtn, photoBtn)
         for (i in 0 until lensBar.childCount) views += lensBar.getChildAt(i)
         views.forEach { it.animate().rotation(deg).setDuration(200).start() }
@@ -1131,6 +1240,11 @@ class MainActivity : Activity() {
         torchChip.setTextColor(if (torch) YELLOW else Color.WHITE)
         tlBadge.text = "ТАЙМЛАПС " + tlName().substringAfter("(").removeSuffix(")") + " · без звука"
         tlBadge.visibility = if (tlIndex > 0) View.VISIBLE else View.GONE
+        profileChip.text = "Цвет: " + profileShort[profile]
+        profileChip.setTextColor(if (profile != 0) YELLOW else Color.WHITE)
+        horizonChip.setTextColor(if (horizonLock) YELLOW else Color.WHITE)
+        timerChip.text = if (timerSec == 0) "⏱ выкл" else "⏱ " + timerSec + " с"
+        timerChip.setTextColor(if (timerSec != 0) YELLOW else Color.WHITE)
         updateReadout()
     }
 
@@ -1146,6 +1260,17 @@ class MainActivity : Activity() {
 
     private fun updateReadout() {
         val parts = mutableListOf<String>()
+        try {
+            val bat = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            if (bat != null) {
+                val lvl = bat.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                val sc = bat.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+                val temp = bat.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) / 10f
+                if (lvl >= 0) parts += "🔋 " + (lvl * 100 / max(1, sc)) + "% " + temp.roundToInt() + "°C"
+            }
+            val pm = getSystemService(PowerManager::class.java)
+            if (pm != null && pm.currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE) parts += "🌡 телефон греется"
+        } catch (_: Exception) {}
         if (shownIso > 0) parts += "ISO " + shownIso
         if (shownExp > 0) parts += expName(shownExp)
         parts += (if (codecHevc) "HEVC" else "H.264") + " " + (bitrateFor(activeCfg ?: pending ?: return) / 1_000_000) + " Мбит/с"
@@ -1344,7 +1469,7 @@ class MainActivity : Activity() {
     private fun applyLevel() {
         level.visibility = if (levelOn) View.VISIBLE else View.GONE
         sensors.unregisterListener(levelListener)
-        if (levelOn && resumed) {
+        if ((levelOn || horizonLock) && resumed) {
             val s = sensors.getDefaultSensor(Sensor.TYPE_GRAVITY) ?: sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
             if (s != null) sensors.registerListener(levelListener, s, SensorManager.SENSOR_DELAY_UI)
         }
@@ -1357,8 +1482,125 @@ class MainActivity : Activity() {
         if ((zebraOn || histOn) && resumed) main.post(analyze)
     }
 
+    private fun aspectTag(s: Size): String {
+        val r = s.width.toFloat() / s.height
+        return when {
+            abs(r - 4f / 3f) < 0.02f -> "   4:3 · Open Gate, макс. угол"
+            abs(r - 16f / 9f) < 0.02f -> "   16:9"
+            abs(r - 1f) < 0.02f -> "   1:1"
+            else -> ""
+        }
+    }
+
+    private fun setProfile(v: Int) {
+        profile = v.coerceIn(0, profileNames.size - 1)
+        gl.profile = profile
+        prefs.edit().putInt("profile", profile).apply()
+        updateChips()
+    }
+
+    private fun pickProfile() {
+        AlertDialog.Builder(this, DIALOG).setTitle("Цветовой профиль")
+            .setItems(profileNames.mapIndexed { i, n -> (if (i == profile) "✓ " else "") + n }.toTypedArray()) { _, i ->
+                setProfile(i)
+                if (i == 1) setStatus("Плоский профиль: картинка бледная — это нормально, цвет добавляется на монтаже", 4000)
+            }.show()
+    }
+
+    private fun pickGuide() {
+        AlertDialog.Builder(this, DIALOG).setTitle("Рамки кадрирования")
+            .setItems(guideNames.mapIndexed { i, n -> (if (i == guide.mode) "✓ " else "") + n }.toTypedArray()) { _, i ->
+                guide.mode = i
+                prefs.edit().putInt("guide", i).apply()
+            }.show()
+    }
+
+    private fun setHorizon(on: Boolean) {
+        horizonLock = on
+        prefs.edit().putBoolean("horizon", on).apply()
+        if (!on) gl.horizonDeg = 0f
+        applyLevel()
+        updateChips()
+        setStatus(if (on) "Горизонт зафиксирован — при наклоне кадр слегка приближается" else "Блокировка горизонта выключена", 2500)
+    }
+
+    private fun cycleTimer() {
+        timerSec = when (timerSec) { 0 -> 3; 3 -> 10; else -> 0 }
+        prefs.edit().putInt("timer", timerSec).apply()
+        updateChips()
+    }
+
+    private fun pickPreset() {
+        val labels = presetNames.mapIndexed { i, n -> n + if (prefs.contains("p" + i + "_cam")) "" else "   (пусто)" }
+        AlertDialog.Builder(this, DIALOG).setTitle("Пресеты")
+            .setItems(labels.toTypedArray()) { _, i ->
+                val has = prefs.contains("p" + i + "_cam")
+                val acts = if (has) arrayOf("Применить", "Сохранить сюда текущие настройки") else arrayOf("Сохранить сюда текущие настройки")
+                AlertDialog.Builder(this, DIALOG).setTitle(presetNames[i])
+                    .setItems(acts) { _, j -> if (has && j == 0) applyPreset(i) else savePreset(i) }.show()
+            }.show()
+    }
+
+    private fun savePreset(i: Int) {
+        val cam = curCam ?: return
+        val p = "p" + i + "_"
+        prefs.edit()
+            .putString(p + "cam", cam.key)
+            .putString(p + "size", curSize.toString())
+            .putString(p + "fps", "" + curFps.lower + "-" + curFps.upper)
+            .putBoolean(p + "hevc", codecHevc)
+            .putInt(p + "bitrate", bitrateLevel)
+            .putBoolean(p + "stab", stab)
+            .putBoolean(p + "dist", distCorr)
+            .putInt(p + "profile", profile)
+            .putInt(p + "grid", grid.mode)
+            .putInt(p + "guide", guide.mode)
+            .putInt(p + "tl", tlIndex)
+            .putBoolean(p + "horizon", horizonLock)
+            .putFloat(p + "zoom", zoom)
+            .apply()
+        setStatus("Пресет «" + presetNames[i] + "» сохранён", 2000)
+    }
+
+    private fun applyPreset(i: Int) {
+        if (recording) { setStatus("Нельзя во время записи"); return }
+        val p = "p" + i + "_"
+        val key = prefs.getString(p + "cam", null) ?: return
+        val cam = cams.firstOrNull { it.key == key }
+        if (cam == null) { setStatus("Камера из пресета не найдена"); return }
+        prefs.edit()
+            .putString("size_" + key, prefs.getString(p + "size", null))
+            .putString("fps_" + key, prefs.getString(p + "fps", null))
+            .apply()
+        codecHevc = prefs.getBoolean(p + "hevc", codecHevc)
+        bitrateLevel = prefs.getInt(p + "bitrate", bitrateLevel).coerceIn(0, 2)
+        stab = prefs.getBoolean(p + "stab", stab)
+        distCorr = prefs.getBoolean(p + "dist", distCorr)
+        grid.mode = prefs.getInt(p + "grid", grid.mode)
+        guide.mode = prefs.getInt(p + "guide", guide.mode)
+        tlIndex = prefs.getInt(p + "tl", 0).coerceIn(0, tlIntervals.size - 1)
+        prefs.edit()
+            .putBoolean("hevc", codecHevc).putInt("bitrate", bitrateLevel)
+            .putBoolean("stab", stab).putBoolean("dist", distCorr)
+            .putInt("grid", grid.mode).putInt("guide", guide.mode)
+            .apply()
+        setProfile(prefs.getInt(p + "profile", 0))
+        val hz = prefs.getBoolean(p + "horizon", false)
+        horizonLock = hz
+        prefs.edit().putBoolean("horizon", hz).apply()
+        if (!hz) gl.horizonDeg = 0f
+        applyLevel()
+        selectCam(cam, prefs.getFloat(p + "zoom", 1f))
+        setStatus("Пресет «" + presetNames[i] + "»", 1500)
+    }
+
     private fun showSettings() {
         val items = arrayOf(
+            "Пресеты: Влог / Кино / Таймлапс / Мой",
+            "Цветовой профиль: " + profileNames[profile],
+            "Рамки кадрирования: " + guideNames[guide.mode],
+            "Блокировка горизонта: " + onOff(horizonLock),
+            "Таймер старта: " + (if (timerSec == 0) "выкл" else "" + timerSec + " с"),
             "Кодек: " + (if (codecHevc) "HEVC (H.265) — компактный" else "H.264 — совместимый"),
             "Битрейт: " + bitrateNames[bitrateLevel],
             "Исправление дисторсии: " + onOff(distCorr),
@@ -1369,28 +1611,33 @@ class MainActivity : Activity() {
             "Гистограмма: " + onOff(histOn),
             "Отчёт о камере",
             "Выбрать камеру вручную",
-            "Жесты"
+            "Жесты и быстрый запуск"
         )
         AlertDialog.Builder(this, DIALOG).setTitle("Настройки")
             .setItems(items) { _, i ->
                 when (i) {
-                    0 -> toggleCodec()
-                    1 -> pickBitrate()
-                    2 -> toggleDist()
-                    3 -> pickTimelapse()
-                    4 -> pickGrid()
-                    5 -> { levelOn = !levelOn; prefs.edit().putBoolean("level", levelOn).apply(); applyLevel() }
-                    6 -> { zebraOn = !zebraOn; prefs.edit().putBoolean("zebra", zebraOn).apply(); applyAnalysis() }
-                    7 -> { histOn = !histOn; prefs.edit().putBoolean("hist", histOn).apply(); applyAnalysis() }
-                    8 -> curCam?.let { cam ->
+                    0 -> pickPreset()
+                    1 -> pickProfile()
+                    2 -> pickGuide()
+                    3 -> setHorizon(!horizonLock)
+                    4 -> cycleTimer()
+                    5 -> toggleCodec()
+                    6 -> pickBitrate()
+                    7 -> toggleDist()
+                    8 -> pickTimelapse()
+                    9 -> pickGrid()
+                    10 -> { levelOn = !levelOn; prefs.edit().putBoolean("level", levelOn).apply(); applyLevel() }
+                    11 -> { zebraOn = !zebraOn; prefs.edit().putBoolean("zebra", zebraOn).apply(); applyAnalysis() }
+                    12 -> { histOn = !histOn; prefs.edit().putBoolean("hist", histOn).apply(); applyAnalysis() }
+                    13 -> curCam?.let { cam ->
                         AlertDialog.Builder(this, DIALOG).setTitle(cam.label)
                             .setMessage(report(cam, curMap)).setPositiveButton("OK", null).show()
                     }
-                    9 -> AlertDialog.Builder(this, DIALOG).setTitle("Все камеры")
-                            .setItems(cams.map { it.label }.toTypedArray()) { _, j -> selectCam(cams[j]) }
-                            .show()
-                    else -> AlertDialog.Builder(this, DIALOG).setTitle("Жесты")
-                        .setMessage("Тап — фокус и замер света по точке\nДолгий тап — зафиксировать фокус и экспозицию\nДвойной тап — сброс на авто\nДва пальца или колесо — зум\nКнопка громкости — старт/стоп записи\n📷 — фото, в том числе во время записи\nОбъективы и фронталку можно переключать прямо во время записи")
+                    14 -> AlertDialog.Builder(this, DIALOG).setTitle("Все камеры")
+                        .setItems(cams.map { it.label }.toTypedArray()) { _, j -> selectCam(cams[j]) }
+                        .show()
+                    else -> AlertDialog.Builder(this, DIALOG).setTitle("Жесты и быстрый запуск")
+                        .setMessage("Тап — фокус и замер света по точке\nДолгий тап — зафиксировать фокус и экспозицию\nДвойной тап — сброс на авто\nДва пальца или колесо — зум\nКнопка громкости — старт/стоп записи\n📷 — фото, в том числе во время записи\nОбъективы и фронталку можно переключать во время записи\n\nБыстрый запуск: опусти шторку → карандаш (изменить) → перетащи плитку «Ширик-камера». Приложение откроется сразу на последнем объективе.")
                         .setPositiveButton("OK", null).show()
                 }
             }.show()
@@ -1502,6 +1749,7 @@ class MainActivity : Activity() {
 
     private fun selectCam(cam: Cam, startZoom: Float = 1f) {
         curCam = cam
+        gl.frontCam = isFront(cam)
         prefs.edit().putString("cam", cam.key).apply()
         val map = streamMap(cam)
         curMap = map
@@ -1584,7 +1832,7 @@ class MainActivity : Activity() {
         val cam = curCam ?: return
         val labels = sizes.map { s ->
             if (s in supportedSizes)
-                sizeName(s) + "   " + s.width + "×" + s.height + "   до " + (maxFps(curMap, s) ?: "?") + " к/с"
+                sizeName(s) + "   " + s.width + "×" + s.height + "   до " + (maxFps(curMap, s) ?: "?") + " к/с" + aspectTag(s)
             else sizeName(s) + "   нет в драйвере — растяну из меньшего (не честное)"
         }
         AlertDialog.Builder(this, DIALOG).setTitle("Разрешение")
@@ -1997,7 +2245,16 @@ class MainActivity : Activity() {
     // ---------- запись ----------
 
     private fun toggleRec() {
-        if (!recording) bg.post { startRec() } else bg.post { stopRec() }
+        if (recording) { bg.post { stopRec() }; return }
+        if (counting) {
+            counting = false
+            main.removeCallbacks(countTask)
+            countText.visibility = View.GONE
+            setStatus("Таймер отменён", 1200)
+            return
+        }
+        if (timerSec > 0) { counting = true; countLeft = timerSec; main.post(countTask) }
+        else bg.post { startRec() }
     }
 
     private fun startRec() {
@@ -2147,5 +2404,19 @@ class MainActivity : Activity() {
         "Сохранено в галерею · " + w + "×" + h + " · " + fps + " к/с"
     } catch (e: Exception) {
         "Сохранено в галерею (Movies/WideCam)"
+    }
+}
+
+/** Плитка в шторке: открывает камеру сразу на последнем объективе. */
+class CamTile : TileService() {
+    override fun onClick() {
+        super.onClick()
+        val i = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (Build.VERSION.SDK_INT >= 34) {
+            startActivityAndCollapse(PendingIntent.getActivity(this, 0, i, PendingIntent.FLAG_IMMUTABLE))
+        } else {
+            @Suppress("DEPRECATION")
+            startActivityAndCollapse(i)
+        }
     }
 }
