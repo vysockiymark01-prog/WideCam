@@ -34,6 +34,7 @@ import android.util.Range
 import android.util.Size
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.OrientationEventListener
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
@@ -112,6 +113,8 @@ class MainActivity : Activity() {
     private val restartTask = Runnable { doRestart(false) }
     private val main = Handler(Looper.getMainLooper())
     private var recStart = 0L
+    @Volatile private var devOrient = 0
+    private lateinit var orient: OrientationEventListener
     private val hideStatus = Runnable { statusText.visibility = View.GONE }
     private val tick = object : Runnable {
         override fun run() {
@@ -129,6 +132,13 @@ class MainActivity : Activity() {
         mgr = getSystemService(CameraManager::class.java)
         prefs = getSharedPreferences("widecam", MODE_PRIVATE)
         buildUi()
+        orient = object : OrientationEventListener(this) {
+            override fun onOrientationChanged(o: Int) {
+                if (o == ORIENTATION_UNKNOWN) return
+                val r = ((o + 45) / 90 * 90) % 360
+                if (r != devOrient) { devOrient = r; rotateUi(r) }
+            }
+        }
         val need = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
         if (need.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) init()
         else requestPermissions(need, 1)
@@ -141,11 +151,13 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        orient.enable()
         if (cams.isNotEmpty() && texture.isAvailable) restartPreview()
     }
 
     override fun onPause() {
         super.onPause()
+        orient.disable()
         bg.removeCallbacks(restartTask)
         bg.post {
             if (recording) stopRec(reopen = false)
@@ -250,6 +262,14 @@ class MainActivity : Activity() {
         root.addView(bottom, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM))
 
         setContentView(root)
+    }
+
+    /** Поворачиваем круглые кнопки вслед за телефоном. */
+    private fun rotateUi(r: Int) = ui {
+        val deg = when (r) { 90 -> -90f; 180 -> 180f; 270 -> 90f; else -> 0f }
+        val views = mutableListOf<View>(infoBtn)
+        for (i in 0 until lensBar.childCount) views += lensBar.getChildAt(i)
+        views.forEach { it.animate().rotation(deg).setDuration(200).start() }
     }
 
     private fun ui(f: () -> Unit) = runOnUiThread(f)
@@ -449,6 +469,24 @@ class MainActivity : Activity() {
         bg.post { closeCamera() }
         updateChips()
         renderLenses()
+        rotateUi(devOrient)
+        restartPreview()
+    }
+
+    /** Если принудительный режим уронил драйвер — возвращаем рабочий. */
+    private fun fallbackIfForced() {
+        val cam = curCam ?: return
+        if (curSize in supportedSizes && curFps in supportedFps) return
+        if (curSize !in supportedSizes) {
+            curSize = Size(1920, 1080).takeIf { it in supportedSizes }
+                ?: supportedSizes.maxByOrNull { it.width * it.height } ?: return
+        }
+        if (curFps !in supportedFps) curFps = bestFps()
+        prefs.edit()
+            .putString("size_" + cam.key, curSize.toString())
+            .putString("fps_" + cam.key, "" + curFps.lower + "-" + curFps.upper)
+            .apply()
+        updateChips()
         restartPreview()
     }
 
@@ -593,7 +631,8 @@ class MainActivity : Activity() {
                 }
                 override fun onError(d: CameraDevice, error: Int) {
                     d.close(); if (device == d) { device = null; deviceId = null }
-                    setStatus("Камера не открылась (код $error) — система не пускает", 6000)
+                    setStatus("Драйвер не выдержал режим " + sizeName(cfg.size) + " · " + fpsName(cfg.fps) + " (код $error) — включил рабочий", 6000)
+                    ui { fallbackIfForced() }
                     if (record) abortRecorder()
                 }
             })
@@ -639,7 +678,8 @@ class MainActivity : Activity() {
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    setStatus("Драйвер не поддерживает режим $mode", 6000)
+                    setStatus("Драйвер не поддерживает режим $mode — включил рабочий", 6000)
+                    ui { fallbackIfForced() }
                     if (record) abortRecorder()
                 }
             })
@@ -692,7 +732,11 @@ class MainActivity : Activity() {
         r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
         r.setAudioSamplingRate(48000)
         r.setAudioEncodingBitRate(192_000)
-        r.setOrientationHint(cfg.cam.chars[CameraCharacteristics.SENSOR_ORIENTATION] ?: 90)
+        // ориентация видео — по тому, как держат телефон в момент старта записи
+        val sensor = cfg.cam.chars[CameraCharacteristics.SENSOR_ORIENTATION] ?: 90
+        val front = cfg.cam.chars[CameraCharacteristics.LENS_FACING] == CameraCharacteristics.LENS_FACING_FRONT
+        val dev = if (front) -devOrient else devOrient
+        r.setOrientationHint((sensor + dev + 360) % 360)
         r.prepare()
         recorder = r
         r
