@@ -1860,6 +1860,50 @@ class MainActivity : Activity() {
         return super.dispatchTouchEvent(ev)
     }
 
+    /** Максимальный угол: самое большое 4:3, без стабилизации, без исправления дисторсии, без горизонта, зум до упора. */
+    private fun maxAngle() {
+        if (recording) { setStatus("Нельзя во время записи"); return }
+        val cam = curCam ?: return
+        val c = cam.chars
+        val done = mutableListOf<String>()
+        val g = supportedSizes.filter { abs(it.width.toFloat() / it.height - 4f / 3f) < 0.02f }
+            .maxByOrNull { it.width * it.height }
+        if (g != null) {
+            curSize = g
+            val m = maxFps(curMap, g)
+            if (curFps !in supportedFps || (m != null && m < curFps.upper)) curFps = bestFps()
+            prefs.edit()
+                .putString("size_" + cam.key, g.toString())
+                .putString("fps_" + cam.key, "" + curFps.lower + "-" + curFps.upper)
+                .apply()
+            done += "4:3 " + g.width + "×" + g.height
+        }
+        if (hasStab(c) && stab) {
+            stab = false
+            prefs.edit().putBoolean("stab", false).apply()
+            done += "стаб выкл"
+        }
+        if (hasDist(c) && distCorr) {
+            distCorr = false
+            prefs.edit().putBoolean("dist", false).apply()
+            done += "дисторсия не исправляется"
+        }
+        if (horizonLock) {
+            horizonLock = false
+            prefs.edit().putBoolean("horizon", false).apply()
+            gl.horizonDeg = 0f
+            applyLevel()
+            done += "горизонт выкл"
+        }
+        if (wheel.visibility == View.VISIBLE && zoom > wheel.zMin + 0.01f) {
+            wheel.set(wheel.zMin)
+            done += "зум минимум"
+        }
+        updateChips()
+        restartPreview()
+        setStatus(if (done.isEmpty()) "Уже максимальный угол для этой камеры" else "Максимальный угол: " + done.joinToString(", "), 4000)
+    }
+
     private fun hyperlapse() {
         if (recording) { setStatus("Нельзя во время записи"); return }
         tlIndex = 2
@@ -1877,6 +1921,7 @@ class MainActivity : Activity() {
     private fun showSettings() {
         val items = arrayOf(
             "Пресеты: Влог / Кино / Таймлапс / Мой",
+            "Максимальный угол — одним нажатием",
             "Цветовой профиль: " + profileNames[profile],
             "Рамки кадрирования: " + guideNames[guide.mode],
             "Блокировка горизонта: " + onOff(horizonLock),
@@ -1904,36 +1949,37 @@ class MainActivity : Activity() {
             .setItems(items) { _, i ->
                 when (i) {
                     0 -> pickPreset()
-                    1 -> pickProfile()
-                    2 -> pickGuide()
-                    3 -> setHorizon(!horizonLock)
-                    4 -> hyperlapse()
-                    5 -> cycleTimer()
-                    6 -> pickInterval()
-                    7 -> pickAudio()
-                    8 -> {
+                    1 -> maxAngle()
+                    2 -> pickProfile()
+                    3 -> pickGuide()
+                    4 -> setHorizon(!horizonLock)
+                    5 -> hyperlapse()
+                    6 -> cycleTimer()
+                    7 -> pickInterval()
+                    8 -> pickAudio()
+                    9 -> {
                         peakOn = !peakOn
                         prefs.edit().putBoolean("peak", peakOn).apply()
                         gl.peaking = peakOn && manFocus != null
                     }
-                    9 -> { lockOnRec = !lockOnRec; prefs.edit().putBoolean("lockRec", lockOnRec).apply() }
-                    10 -> { dimOnRec = !dimOnRec; prefs.edit().putBoolean("dimRec", dimOnRec).apply() }
-                    11 -> toggleCodec()
-                    12 -> pickBitrate()
-                    13 -> toggleDist()
-                    14 -> pickTimelapse()
-                    15 -> pickGrid()
-                    16 -> { levelOn = !levelOn; prefs.edit().putBoolean("level", levelOn).apply(); applyLevel() }
-                    17 -> { zebraOn = !zebraOn; prefs.edit().putBoolean("zebra", zebraOn).apply(); applyAnalysis() }
-                    18 -> { histOn = !histOn; prefs.edit().putBoolean("hist", histOn).apply(); applyAnalysis() }
-                    19 -> curCam?.let { cam ->
+                    10 -> { lockOnRec = !lockOnRec; prefs.edit().putBoolean("lockRec", lockOnRec).apply() }
+                    11 -> { dimOnRec = !dimOnRec; prefs.edit().putBoolean("dimRec", dimOnRec).apply() }
+                    12 -> toggleCodec()
+                    13 -> pickBitrate()
+                    14 -> toggleDist()
+                    15 -> pickTimelapse()
+                    16 -> pickGrid()
+                    17 -> { levelOn = !levelOn; prefs.edit().putBoolean("level", levelOn).apply(); applyLevel() }
+                    18 -> { zebraOn = !zebraOn; prefs.edit().putBoolean("zebra", zebraOn).apply(); applyAnalysis() }
+                    19 -> { histOn = !histOn; prefs.edit().putBoolean("hist", histOn).apply(); applyAnalysis() }
+                    20 -> curCam?.let { cam ->
                         AlertDialog.Builder(this, DIALOG).setTitle(cam.label)
                             .setMessage(report(cam, curMap)).setPositiveButton("OK", null).show()
                     }
-                    20 -> AlertDialog.Builder(this, DIALOG).setTitle("Все камеры")
+                    21 -> AlertDialog.Builder(this, DIALOG).setTitle("Все камеры")
                         .setItems(cams.map { it.label }.toTypedArray()) { _, j -> selectCam(cams[j]) }
                         .show()
-                    21 -> {
+                    22 -> {
                         mirrorFront = !mirrorFront
                         prefs.edit().putBoolean("mirrorFront", mirrorFront).apply()
                         setStatus(if (mirrorFront) "Видео с фронталки — зеркальное, как в зеркале" else "Видео с фронталки — как в жизни, текст читается", 2500)
