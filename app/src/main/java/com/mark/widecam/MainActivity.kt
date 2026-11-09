@@ -721,6 +721,7 @@ class MainActivity : Activity() {
     private var lockOnRec = false
     private var dimOnRec = false
     private var dimmed = false
+    private var mirrorFront = false
     private var intervalSec = 0
     private var seriesOn = false
     private val markers = mutableListOf<Long>()
@@ -889,6 +890,7 @@ class MainActivity : Activity() {
         micType = prefs.getInt("mic", 0)
         lockOnRec = prefs.getBoolean("lockRec", false)
         dimOnRec = prefs.getBoolean("dimRec", false)
+        mirrorFront = prefs.getBoolean("mirrorFront", false)
         intervalSec = prefs.getInt("interval", 0)
         orient = object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
@@ -1895,6 +1897,7 @@ class MainActivity : Activity() {
             "Гистограмма: " + onOff(histOn),
             "Отчёт о камере",
             "Выбрать камеру вручную",
+            "Зеркальное видео с фронталки: " + onOff(mirrorFront),
             "Жесты и быстрый запуск"
         )
         AlertDialog.Builder(this, DIALOG).setTitle("Настройки")
@@ -1930,6 +1933,11 @@ class MainActivity : Activity() {
                     20 -> AlertDialog.Builder(this, DIALOG).setTitle("Все камеры")
                         .setItems(cams.map { it.label }.toTypedArray()) { _, j -> selectCam(cams[j]) }
                         .show()
+                    21 -> {
+                        mirrorFront = !mirrorFront
+                        prefs.edit().putBoolean("mirrorFront", mirrorFront).apply()
+                        setStatus(if (mirrorFront) "Видео с фронталки — зеркальное, как в зеркале" else "Видео с фронталки — как в жизни, текст читается", 2500)
+                    }
                     else -> AlertDialog.Builder(this, DIALOG).setTitle("Жесты и быстрый запуск")
                         .setMessage("Тап — фокус и замер света по точке\nДолгий тап — зафиксировать фокус и экспозицию\nДвойной тап — сброс на авто\nДва пальца или колесо — зум\nКнопка громкости — старт/стоп записи\n📷 — фото, в том числе во время записи\n★ — метка во время записи (сохраняются в Documents/WideCam)\nОбъективы и фронталку можно переключать во время записи\n\nБыстрый запуск: опусти шторку → карандаш (изменить) → перетащи плитку «Ширик-камера».")
                         .setPositiveButton("OK", null).show()
@@ -2043,7 +2051,7 @@ class MainActivity : Activity() {
 
     private fun selectCam(cam: Cam, startZoom: Float = 1f) {
         curCam = cam
-        gl.frontCam = isFront(cam)
+        gl.frontCam = false
         prefs.edit().putString("cam", cam.key).apply()
         val map = streamMap(cam)
         curMap = map
@@ -2467,7 +2475,7 @@ class MainActivity : Activity() {
                     activeTemplate = CameraDevice.TEMPLATE_RECORD
                     activeTargets = listOf(camSurface)
                     activeCfg = cfg
-                    if (recording) gl.setMirror(isFront(cfg.cam))
+                    if (recording) gl.setMirror(isFront(cfg.cam) && mirrorFront)
                     gl.texelX = 1f / cfg.preview.width; gl.texelY = 1f / cfg.preview.height
                     applyControls(afPoint != null && canFocus(cfg.cam.chars))
                     ui { updateReadout() }
@@ -2591,7 +2599,7 @@ class MainActivity : Activity() {
             recorder = r
             r.start()
             recording = true
-            gl.setEncoder(r.surface, vw, vh, -devOrient.toFloat(), isFront(cfg.cam))
+            gl.setEncoder(r.surface, vw, vh, -devOrient.toFloat(), isFront(cfg.cam) && mirrorFront)
             setRecUi(true)
         } catch (e: Exception) {
             setStatus("Запись не запустилась: " + e.message, 6000)
