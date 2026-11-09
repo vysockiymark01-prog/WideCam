@@ -104,6 +104,7 @@ class ZoomWheel(ctx: Context) : View(ctx) {
     var zMax = 8f
     var value = 1f
     var factor = 1f
+    var mmBase = 0f
     var onChange: ((Float) -> Unit)? = null
     private val d = ctx.resources.displayMetrics.density
     private val tick = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; strokeWidth = 1.5f * d }
@@ -132,7 +133,10 @@ class ZoomWheel(ctx: Context) : View(ctx) {
             z += if (z < 1.95f) 0.1f else if (z < 4.9f) 0.25f else 0.5f
         }
         c.drawLine(cx, base + 2 * d, cx, base - 24 * d, mark)
-        c.drawText(String.format(Locale.US, "%.1f×", value * factor), cx, base - 30 * d, txt)
+        val shown = value * factor
+        val label = if (mmBase > 0f) String.format(Locale.US, "%.1f× · %d мм", shown, (shown * mmBase).roundToInt())
+            else String.format(Locale.US, "%.1f×", shown)
+        c.drawText(label, cx, base - 30 * d, txt)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -514,7 +518,7 @@ class MainActivity : Activity() {
         val key: String get() = openId + "/" + (physicalId ?: "")
     }
 
-    private data class Lens(val title: String, val cam: Cam)
+    private data class Lens(val title: String, val cam: Cam, val zoom: Float = 1f)
     private data class Cfg(val cam: Cam, val size: Size, val fps: Range<Int>, val preview: Size)
 
     companion object {
@@ -651,6 +655,7 @@ class MainActivity : Activity() {
     private var lastReadout = 0L
     private lateinit var orient: OrientationEventListener
     private val hideStatus = Runnable { statusText.visibility = View.GONE }
+    private val lensRefresh = Runnable { renderLenses() }
     private val hideRing = Runnable { if (!aeAfLocked) ring.visibility = View.INVISIBLE }
 
     private val tick = object : Runnable {
@@ -934,7 +939,10 @@ class MainActivity : Activity() {
         }
         bottom.addView(readout, lp(WRAP, WRAP))
         wheel = ZoomWheel(this).apply {
-            onChange = { z -> zoom = z; bg.removeCallbacks(applyTask); bg.post(applyTask) }
+            onChange = { z ->
+                zoom = z; bg.removeCallbacks(applyTask); bg.post(applyTask)
+                main.removeCallbacks(lensRefresh); main.postDelayed(lensRefresh, 150)
+            }
         }
         bottom.addView(wheel, lp(MATCH, dp(60)).apply { bottomMargin = dp(4) })
         lensBar = LinearLayout(this).apply {
@@ -1000,9 +1008,20 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun uiDeg(r: Int) = when (r) { 90 -> -90f; 180 -> 180f; 270 -> 90f; else -> 0f }
+
+    private fun pickLens(l: Lens) {
+        if (curCam?.key == l.cam.key) {
+            wheel.set(l.zoom)
+            renderLenses()
+        } else {
+            selectCam(l.cam, l.zoom)
+        }
+    }
+
     /** Поворачиваем круглые кнопки вслед за телефоном. */
     private fun rotateUi(r: Int) = ui {
-        val deg = when (r) { 90 -> -90f; 180 -> 180f; 270 -> 90f; else -> 0f }
+        val deg = uiDeg(r)
         val views = mutableListOf<View>(settingsBtn, pauseBtn, galleryBtn, photoBtn)
         for (i in 0 until lensBar.childCount) views += lensBar.getChildAt(i)
         views.forEach { it.animate().rotation(deg).setDuration(200).start() }
@@ -1138,7 +1157,7 @@ class MainActivity : Activity() {
     private fun renderLenses() {
         lensBar.removeAllViews()
         for (l in lenses) {
-            val sel = l.cam.key == curCam?.key
+            val sel = l.cam.key == curCam?.key && abs(zoom - l.zoom) < 0.05f
             val front = l.title == "Фронт"
             val tv = TextView(this).apply {
                 text = if (sel && !front) l.title + "×" else l.title
@@ -1147,7 +1166,8 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
                 gravity = Gravity.CENTER
                 background = pill(if (sel) 0x88000000.toInt() else 0x00000000)
-                setOnClickListener { selectCam(l.cam) }
+                rotation = uiDeg(devOrient)
+                setOnClickListener { pickLens(l) }
             }
             lensBar.addView(tv, lp(if (front) dp(64) else dp(48), dp(44)).apply {
                 leftMargin = dp(2); rightMargin = dp(2)
@@ -1432,6 +1452,12 @@ class MainActivity : Activity() {
             val t = if (z < 0.95f) String.format(Locale.US, "%.1f", z) else z.roundToInt().toString()
             lenses += Lens(t, c)
         }
+        // быстрые кнопки цифрового зума на основном модуле
+        if (mainCam != null) {
+            val zr = if (Build.VERSION.SDK_INT >= 30) mainCam.chars[CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE] else null
+            val zMaxMain = zr?.upper ?: (mainCam.chars[CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM] ?: 1f)
+            for (p in listOf(2f, 3f, 5f)) if (p <= zMaxMain + 0.01f) lenses += Lens(p.roundToInt().toString(), mainCam, p)
+        }
         cams.filter { facing(it.chars) == CameraCharacteristics.LENS_FACING_FRONT }
             .minByOrNull { rank(it) }?.let { lenses += Lens("Фронт", it) }
     }
@@ -1474,7 +1500,7 @@ class MainActivity : Activity() {
             ?: ok.maxByOrNull { it.upper } ?: fpsRanges.first()
     }
 
-    private fun selectCam(cam: Cam) {
+    private fun selectCam(cam: Cam, startZoom: Float = 1f) {
         curCam = cam
         prefs.edit().putString("cam", cam.key).apply()
         val map = streamMap(cam)
@@ -1524,8 +1550,8 @@ class MainActivity : Activity() {
         if (zr != null) { useZoomRatio = true; zMin = zr.lower; zMax = zr.upper }
         else { useZoomRatio = false; zMax = cam.chars[CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM] ?: 1f }
         zMax = min(zMax, 10f)
-        zoom = 1f.coerceIn(zMin, max(zMax, zMin))
-        wheel.zMin = zMin; wheel.zMax = zMax; wheel.factor = eqFocal(cam.chars) / mainEq
+        zoom = startZoom.coerceIn(zMin, max(zMax, zMin))
+        wheel.zMin = zMin; wheel.zMax = zMax; wheel.factor = eqFocal(cam.chars) / mainEq; wheel.mmBase = mainEq
         wheel.set(zoom, false)
         wheel.visibility = if (zMax > zMin + 0.05f) View.VISIBLE else View.INVISIBLE
 
