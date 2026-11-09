@@ -6,6 +6,8 @@
     <uses-feature android:name="android.hardware.camera" android:required="true" />
 
     <application
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="Ширик-камера"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <activity
