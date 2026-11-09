@@ -2,6 +2,7 @@ package com.mark.widecam
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.PendingIntent
@@ -39,6 +40,8 @@ import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaMetadataRetriever
@@ -81,6 +84,7 @@ import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import java.io.File
 import java.text.SimpleDateFormat
@@ -401,6 +405,11 @@ class GlPipe {
     @Volatile var frontCam = false
     private val corr = FloatArray(16)
     private val tmp = FloatArray(16)
+    @Volatile var peaking = false
+    @Volatile var texelX = 1f / 1920f
+    @Volatile var texelY = 1f / 1080f
+    private var uPeak = 0
+    private var uTexel = 0
     private val st = FloatArray(16)
     private val mvp = FloatArray(16)
     private val ident = FloatArray(16)
@@ -446,7 +455,7 @@ class GlPipe {
         camTexture.setOnFrameAvailableListener({ draw() }, handler)
 
         val vs = "attribute vec4 aPos;\nattribute vec4 aTex;\nuniform mat4 uST;\nuniform mat4 uMVP;\nvarying vec2 vTex;\nvoid main() {\n  gl_Position = uMVP * aPos;\n  vTex = (uST * aTex).xy;\n}\n"
-        val fs = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\nvarying vec2 vTex;\nuniform samplerExternalOES sTex;\nuniform int uProf;\nvec3 sat(vec3 c, float s) { float l = dot(c, vec3(0.299, 0.587, 0.114)); return mix(vec3(l), c, s); }\nvec3 con(vec3 c, float k) { return (c - 0.5) * k + 0.5; }\nvoid main() {\n  vec3 c = texture2D(sTex, vTex).rgb;\n  if (uProf == 1) { c = con(c, 0.78) + 0.03; c = sat(c, 0.8); }\n  else if (uProf == 2) { c = sat(c, 0.85); c = con(c, 1.12); float l = dot(c, vec3(0.299, 0.587, 0.114)); c += vec3(0.05, 0.0, -0.05) * (l - 0.5) * 2.0; }\n  else if (uProf == 3) { c = sat(c, 1.3); c = con(c, 1.08); }\n  else if (uProf == 4) { float l = dot(c, vec3(0.299, 0.587, 0.114)); c = con(vec3(l), 1.15); }\n  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);\n}\n"
+        val fs = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\nvarying vec2 vTex;\nuniform samplerExternalOES sTex;\nuniform int uProf;\nuniform int uPeak;\nuniform vec2 uTexel;\nvec3 sat(vec3 c, float s) { float l = dot(c, vec3(0.299, 0.587, 0.114)); return mix(vec3(l), c, s); }\nvec3 con(vec3 c, float k) { return (c - 0.5) * k + 0.5; }\nvoid main() {\n  vec3 c = texture2D(sTex, vTex).rgb;\n  if (uProf == 1) { c = con(c, 0.78) + 0.03; c = sat(c, 0.8); }\n  else if (uProf == 2) { c = sat(c, 0.85); c = con(c, 1.12); float l = dot(c, vec3(0.299, 0.587, 0.114)); c += vec3(0.05, 0.0, -0.05) * (l - 0.5) * 2.0; }\n  else if (uProf == 3) { c = sat(c, 1.3); c = con(c, 1.08); }\n  else if (uProf == 4) { float l = dot(c, vec3(0.299, 0.587, 0.114)); c = con(vec3(l), 1.15); }\n  if (uPeak == 1) {\n    float l0 = dot(texture2D(sTex, vTex).rgb, vec3(0.299, 0.587, 0.114));\n    float lx = dot(texture2D(sTex, vTex + vec2(uTexel.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n    float ly = dot(texture2D(sTex, vTex + vec2(0.0, uTexel.y)).rgb, vec3(0.299, 0.587, 0.114));\n    if (abs(lx - l0) + abs(ly - l0) > 0.12) c = vec3(1.0, 0.15, 0.15);\n  }\n  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);\n}\n"
         prog = GLES20.glCreateProgram()
         GLES20.glAttachShader(prog, shader(GLES20.GL_VERTEX_SHADER, vs))
         GLES20.glAttachShader(prog, shader(GLES20.GL_FRAGMENT_SHADER, fs))
@@ -456,6 +465,8 @@ class GlPipe {
         uST = GLES20.glGetUniformLocation(prog, "uST")
         uMVP = GLES20.glGetUniformLocation(prog, "uMVP")
         uProf = GLES20.glGetUniformLocation(prog, "uProf")
+        uPeak = GLES20.glGetUniformLocation(prog, "uPeak")
+        uTexel = GLES20.glGetUniformLocation(prog, "uTexel")
         android.opengl.Matrix.setIdentityM(ident, 0)
     }
 
@@ -466,13 +477,15 @@ class GlPipe {
         return s
     }
 
-    private fun quadDraw(m: FloatArray) {
+    private fun quadDraw(m: FloatArray, peak: Boolean = false) {
         GLES20.glUseProgram(prog)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
         GLES20.glUniformMatrix4fv(uST, 1, false, st, 0)
         GLES20.glUniformMatrix4fv(uMVP, 1, false, m, 0)
         GLES20.glUniform1i(uProf, profile)
+        GLES20.glUniform1i(uPeak, if (peak) 1 else 0)
+        GLES20.glUniform2f(uTexel, texelX, texelY)
         quad.position(0)
         GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, quad)
         GLES20.glEnableVertexAttribArray(aPos)
@@ -491,7 +504,7 @@ class GlPipe {
             if (prevSurf != EGL14.EGL_NO_SURFACE) {
                 EGL14.eglMakeCurrent(dpy, prevSurf, prevSurf, ctx)
                 GLES20.glViewport(0, 0, pw, ph)
-                quadDraw(corr)
+                quadDraw(corr, peaking)
                 EGL14.eglSwapBuffers(dpy, prevSurf)
             }
             if (encSurf != EGL14.EGL_NO_SURFACE) {
@@ -645,6 +658,11 @@ class MainActivity : Activity() {
     private lateinit var timerChip: TextView
     private lateinit var guide: GuideView
     private lateinit var countText: TextView
+    private lateinit var focusChip: TextView
+    private lateinit var starChip: TextView
+    private lateinit var focusPanel: LinearLayout
+    private lateinit var focusBar: SeekBar
+    private lateinit var lockOverlay: TextView
     private lateinit var settingsBtn: TextView
     private lateinit var wheel: ZoomWheel
     private lateinit var lensBar: LinearLayout
@@ -694,6 +712,20 @@ class MainActivity : Activity() {
     private var timerSec = 0
     private var counting = false
     private var countLeft = 0
+    @Volatile private var manFocus: Float? = null
+    private var focusA: Float? = null
+    private var focusB: Float? = null
+    private var peakOn = true
+    private var audioMode = 0
+    private var micType = 0
+    private var lockOnRec = false
+    private var dimOnRec = false
+    private var dimmed = false
+    private var intervalSec = 0
+    private var seriesOn = false
+    private val markers = mutableListOf<Long>()
+    private var markerBase = ""
+    private var pullAnim: ValueAnimator? = null
     private var resumed = false
     private var smoothRoll = 0f
 
@@ -729,6 +761,14 @@ class MainActivity : Activity() {
     private lateinit var orient: OrientationEventListener
     private val hideStatus = Runnable { statusText.visibility = View.GONE }
     private val lensRefresh = Runnable { renderLenses() }
+    private val dimTask = Runnable { if (recording && dimOnRec) setDim(true) }
+    private val seriesTask = object : Runnable {
+        override fun run() {
+            if (!seriesOn) return
+            takePhoto()
+            main.postDelayed(this, intervalSec * 1000L)
+        }
+    }
     private val countTask = object : Runnable {
         override fun run() {
             if (!counting) return
@@ -844,6 +884,12 @@ class MainActivity : Activity() {
         gl.profile = profile
         horizonLock = prefs.getBoolean("horizon", false)
         timerSec = prefs.getInt("timer", 0)
+        peakOn = prefs.getBoolean("peak", true)
+        audioMode = prefs.getInt("audioMode", 0)
+        micType = prefs.getInt("mic", 0)
+        lockOnRec = prefs.getBoolean("lockRec", false)
+        dimOnRec = prefs.getBoolean("dimRec", false)
+        intervalSec = prefs.getInt("interval", 0)
         orient = object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
                 if (o == ORIENTATION_UNKNOWN) return
@@ -874,6 +920,8 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         resumed = false
+        seriesOn = false
+        main.removeCallbacks(seriesTask)
         orient.disable()
         sensors.unregisterListener(levelListener)
         main.removeCallbacks(analyze)
@@ -1017,8 +1065,10 @@ class MainActivity : Activity() {
         profileChip = chip().apply { setOnClickListener { pickProfile() } }
         horizonChip = chip().apply { text = "Горизонт"; setOnClickListener { setHorizon(!horizonLock) } }
         timerChip = chip().apply { setOnClickListener { cycleTimer() } }
+        focusChip = chip().apply { setOnClickListener { toggleFocusPanel() } }
+        starChip = chip().apply { text = "★ Метка"; setTextColor(YELLOW); visibility = View.GONE; setOnClickListener { addMarker() } }
         settingsBtn = chip().apply { text = "⚙"; textSize = 17f; setOnClickListener { showSettings() } }
-        listOf(resChip, fpsChip, isoChip, shutterChip, wbChip, evChip, profileChip, stabChip, horizonChip, timerChip, torchChip, settingsBtn)
+        listOf(starChip, resChip, fpsChip, focusChip, isoChip, shutterChip, wbChip, evChip, profileChip, stabChip, horizonChip, timerChip, torchChip, settingsBtn)
             .forEachIndexed { i, v -> row.addView(v, lp(WRAP, WRAP).apply { if (i > 0) leftMargin = dp(8) }) }
         val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
         scroll.addView(row, FrameLayout.LayoutParams(WRAP, MATCH))
@@ -1045,6 +1095,31 @@ class MainActivity : Activity() {
             setTextColor(0xBBFFFFFF.toInt()); textSize = 12f; gravity = Gravity.CENTER
         }
         bottom.addView(readout, lp(WRAP, WRAP))
+        focusPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(4), dp(12), dp(4)); visibility = View.GONE
+        }
+        focusBar = SeekBar(this).apply {
+            max = 1000
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) { if (fromUser) setManualFocus(p / 1000f) }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
+        focusPanel.addView(TextView(this).apply { text = "∞"; setTextColor(Color.WHITE); textSize = 15f })
+        focusPanel.addView(focusBar, LinearLayout.LayoutParams(0, WRAP, 1f))
+        focusPanel.addView(TextView(this).apply { text = "близко"; setTextColor(Color.WHITE); textSize = 12f })
+        listOf("A", "B", "A↔B").forEach { label ->
+            val b = chip().apply {
+                text = label; textSize = 12f; setPadding(dp(10), dp(5), dp(10), dp(5))
+                setOnClickListener {
+                    when (label) { "A" -> setPoint(true); "B" -> setPoint(false); else -> pullFocus() }
+                }
+            }
+            focusPanel.addView(b, lp(WRAP, WRAP).apply { leftMargin = dp(5) })
+        }
+        bottom.addView(focusPanel, lp(MATCH, WRAP))
         wheel = ZoomWheel(this).apply {
             onChange = { z ->
                 zoom = z; bg.removeCallbacks(applyTask); bg.post(applyTask)
@@ -1071,7 +1146,7 @@ class MainActivity : Activity() {
         pauseBtn = roundBtn("❚❚").apply { visibility = View.GONE; setOnClickListener { togglePause() } }
         leftSlot.addView(galleryBtn, FrameLayout.LayoutParams(MATCH, MATCH))
         leftSlot.addView(pauseBtn, FrameLayout.LayoutParams(MATCH, MATCH))
-        photoBtn = roundBtn("📷").apply { textSize = 20f; setOnClickListener { takePhoto() } }
+        photoBtn = roundBtn("📷").apply { textSize = 20f; setOnClickListener { onPhotoBtn() } }
         recOuter = FrameLayout(this).apply {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(dp(4), Color.WHITE)
@@ -1091,6 +1166,15 @@ class MainActivity : Activity() {
         flashView = View(this).apply { setBackgroundColor(Color.WHITE); alpha = 0f }
         root.addView(flashView, FrameLayout.LayoutParams(MATCH, MATCH))
         flashView.isClickable = false
+        lockOverlay = TextView(this).apply {
+            text = "🔒 Экран заблокирован\nудерживай палец, чтобы разблокировать\nкнопка громкости — стоп"
+            setTextColor(0xCCFFFFFF.toInt()); textSize = 13f
+            gravity = Gravity.CENTER_HORIZONTAL or Gravity.BOTTOM
+            setPadding(0, 0, 0, dp(140)); setBackgroundColor(0x01000000); visibility = View.GONE
+            isClickable = true
+            setOnLongClickListener { visibility = View.GONE; setStatus("Экран разблокирован", 1200); true }
+        }
+        root.addView(lockOverlay, FrameLayout.LayoutParams(MATCH, MATCH))
 
         setContentView(root)
     }
@@ -1160,6 +1244,10 @@ class MainActivity : Activity() {
         listOf<View>(resChip, fpsChip, stabChip).forEach { it.alpha = a; it.isEnabled = !rec }
         main.removeCallbacks(tick)
         main.removeCallbacks(meterTask)
+        starChip.visibility = if (rec) View.VISIBLE else View.GONE
+        lockOverlay.visibility = if (rec && lockOnRec) View.VISIBLE else View.GONE
+        main.removeCallbacks(dimTask)
+        if (rec && dimOnRec) main.postDelayed(dimTask, 5000) else if (dimmed) setDim(false)
         if (rec) {
             recStart = SystemClock.elapsedRealtime(); pausedTotal = 0L; paused = false
             timerText.text = "● 00:00"
@@ -1245,6 +1333,8 @@ class MainActivity : Activity() {
         horizonChip.setTextColor(if (horizonLock) YELLOW else Color.WHITE)
         timerChip.text = if (timerSec == 0) "⏱ выкл" else "⏱ " + timerSec + " с"
         timerChip.setTextColor(if (timerSec != 0) YELLOW else Color.WHITE)
+        focusChip.text = if (manFocus != null) "Фокус MF" else "Фокус авто"
+        focusChip.setTextColor(if (manFocus != null) YELLOW else Color.WHITE)
         updateReadout()
     }
 
@@ -1594,13 +1684,207 @@ class MainActivity : Activity() {
         setStatus("Пресет «" + presetNames[i] + "»", 1500)
     }
 
+    // ----- ручной фокус -----
+
+    private fun minFocus(): Float = curCam?.chars?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+
+    private fun toggleFocusPanel() {
+        val c = curCam?.chars ?: return
+        if (!canFocus(c)) { setStatus("У этого объектива фокус фиксированный — ручной фокус есть на 1×", 3000); return }
+        if (focusPanel.visibility == View.VISIBLE) {
+            focusPanel.visibility = View.GONE
+            manFocus = null
+            gl.peaking = false
+            setStatus("Автофокус", 1200)
+            updateChips()
+            bg.post(applyTask)
+        } else {
+            focusPanel.visibility = View.VISIBLE
+            val mn = max(0.001f, minFocus())
+            val v = manFocus ?: (0.2f * mn)
+            focusBar.progress = (v / mn * 1000).roundToInt()
+            setManualFocus(focusBar.progress / 1000f)
+            if (peakOn) setStatus("Ручной фокус: красным подсвечены резкие края", 2500)
+        }
+    }
+
+    private fun setManualFocus(frac: Float) {
+        manFocus = frac.coerceIn(0f, 1f) * minFocus()
+        gl.peaking = peakOn
+        updateChips()
+        bg.removeCallbacks(applyTask); bg.post(applyTask)
+    }
+
+    private fun setPoint(a: Boolean) {
+        val v = manFocus ?: return
+        if (a) focusA = v else focusB = v
+        setStatus("Точка " + (if (a) "A" else "B") + " сохранена", 1200)
+    }
+
+    private fun pullFocus() {
+        val a = focusA
+        val b = focusB
+        if (a == null || b == null) { setStatus("Сначала поставь фокус и сохрани точки A и B", 2500); return }
+        val cur = manFocus ?: a
+        val to = if (abs(cur - b) < abs(cur - a)) a else b
+        val mn = max(0.001f, minFocus())
+        pullAnim?.cancel()
+        pullAnim = ValueAnimator.ofFloat(cur, to).apply {
+            duration = 2000
+            addUpdateListener { an ->
+                val v = an.animatedValue as Float
+                manFocus = v
+                focusBar.progress = (v / mn * 1000).roundToInt()
+                bg.removeCallbacks(applyTask); bg.post(applyTask)
+            }
+            start()
+        }
+    }
+
+    // ----- метки -----
+
+    private fun recMs(): Long {
+        val now = SystemClock.elapsedRealtime()
+        return now - recStart - pausedTotal - (if (paused) now - pausedAt else 0L)
+    }
+
+    private fun fmtTime(ms: Long): String {
+        val s = ms / 1000
+        return String.format(Locale.US, "%02d:%02d", s / 60, s % 60)
+    }
+
+    private fun addMarker() {
+        if (!recording) return
+        val ms = recMs()
+        markers += ms
+        setStatus("★ Метка " + fmtTime(ms), 1200)
+    }
+
+    private fun saveMarkers(base: String) {
+        if (markers.isEmpty()) return
+        try {
+            val v = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, base + "_метки.txt")
+                put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "Documents/WideCam")
+            }
+            val uri = contentResolver.insert(MediaStore.Files.getContentUri("external"), v) ?: return
+            val text = "Метки для " + base + ".mp4\n" +
+                markers.mapIndexed { i, m -> "" + (i + 1) + ". " + fmtTime(m) }.joinToString("\n") + "\n"
+            contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) }
+        } catch (_: Exception) {}
+    }
+
+    // ----- фото сериями -----
+
+    private fun onPhotoBtn() {
+        if (intervalSec <= 0 || recording) { takePhoto(); return }
+        seriesOn = !seriesOn
+        main.removeCallbacks(seriesTask)
+        if (seriesOn) {
+            photoBtn.text = "■"; photoBtn.setTextColor(YELLOW)
+            setStatus("Серия: фото каждые " + intervalSec + " с · ■ — стоп", 3000)
+            main.post(seriesTask)
+        } else {
+            photoBtn.text = "📷"; photoBtn.setTextColor(Color.WHITE)
+            setStatus("Серия остановлена", 1500)
+        }
+    }
+
+    private fun pickInterval() {
+        val opts = intArrayOf(0, 2, 5, 10, 30, 60)
+        AlertDialog.Builder(this, DIALOG).setTitle("Интервальная съёмка фото")
+            .setItems(opts.map { (if (it == intervalSec) "✓ " else "") + if (it == 0) "Выкл (обычное фото)" else "Каждые " + it + " с" }.toTypedArray()) { _, i ->
+                intervalSec = opts[i]
+                prefs.edit().putInt("interval", intervalSec).apply()
+                if (intervalSec > 0) setStatus("Нажми 📷 — начнётся серия", 2500)
+            }.show()
+    }
+
+    // ----- звук -----
+
+    private fun unprocessedOk(): Boolean = try {
+        getSystemService(AudioManager::class.java)?.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
+    } catch (e: Exception) { false }
+
+    private fun mics(): List<AudioDeviceInfo> = try {
+        getSystemService(AudioManager::class.java)?.getDevices(AudioManager.GET_DEVICES_INPUTS)?.toList() ?: emptyList()
+    } catch (e: Exception) { emptyList() }
+
+    private fun micName(t: Int): String = when (t) {
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "встроенный"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "проводной (3.5 мм)"
+        AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> "USB-C"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth"
+        else -> "другой (" + t + ")"
+    }
+
+    private fun pickMic(): AudioDeviceInfo? = if (micType == 0) null else mics().firstOrNull { it.type == micType }
+
+    private fun pickAudio() {
+        if (recording) { setStatus("Нельзя менять во время записи"); return }
+        val devs = mics().map { it.type }.distinct()
+        val items = mutableListOf((if (micType == 0) "✓ " else "") + "Микрофон: авто")
+        devs.forEach { items += (if (micType == it) "✓ " else "") + "Микрофон: " + micName(it) }
+        items += (if (audioMode == 0) "✓ " else "") + "Обработка: шумо- и ветроподавление телефона"
+        items += (if (audioMode == 1) "✓ " else "") + "Обработка: выкл, чистый звук" + if (unprocessedOk()) "" else " (не поддерживается)"
+        AlertDialog.Builder(this, DIALOG).setTitle("Звук")
+            .setItems(items.toTypedArray()) { _, i ->
+                when {
+                    i == 0 -> micType = 0
+                    i <= devs.size -> micType = devs[i - 1]
+                    i == devs.size + 1 -> audioMode = 0
+                    else -> audioMode = 1
+                }
+                prefs.edit().putInt("mic", micType).putInt("audioMode", audioMode).apply()
+            }.show()
+    }
+
+    // ----- экран при записи -----
+
+    private fun setDim(on: Boolean) {
+        dimmed = on
+        val lp = window.attributes
+        lp.screenBrightness = if (on) 0.02f else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        window.attributes = lp
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (recording && dimOnRec) {
+            if (dimmed) setDim(false)
+            main.removeCallbacks(dimTask)
+            main.postDelayed(dimTask, 5000)
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun hyperlapse() {
+        if (recording) { setStatus("Нельзя во время записи"); return }
+        tlIndex = 2
+        if (!horizonLock) setHorizon(true)
+        val c = curCam?.chars
+        if (c != null && hasStab(c) && !stab) {
+            stab = true
+            prefs.edit().putBoolean("stab", true).apply()
+            restartPreview()
+        }
+        updateChips()
+        setStatus("Гиперлапс: 1 кадр/с (×30) + горизонт + стабилизация. Иди плавно", 4000)
+    }
+
     private fun showSettings() {
         val items = arrayOf(
             "Пресеты: Влог / Кино / Таймлапс / Мой",
             "Цветовой профиль: " + profileNames[profile],
             "Рамки кадрирования: " + guideNames[guide.mode],
             "Блокировка горизонта: " + onOff(horizonLock),
+            "Гиперлапс — включить одним нажатием",
             "Таймер старта: " + (if (timerSec == 0) "выкл" else "" + timerSec + " с"),
+            "Интервальная съёмка фото: " + (if (intervalSec == 0) "выкл" else "каждые " + intervalSec + " с"),
+            "Звук: микрофон и обработка",
+            "Фокус-пикинг при ручном фокусе: " + onOff(peakOn),
+            "Блокировка экрана при записи: " + onOff(lockOnRec),
+            "Затемнять экран при записи: " + onOff(dimOnRec),
             "Кодек: " + (if (codecHevc) "HEVC (H.265) — компактный" else "H.264 — совместимый"),
             "Битрейт: " + bitrateNames[bitrateLevel],
             "Исправление дисторсии: " + onOff(distCorr),
@@ -1620,24 +1904,34 @@ class MainActivity : Activity() {
                     1 -> pickProfile()
                     2 -> pickGuide()
                     3 -> setHorizon(!horizonLock)
-                    4 -> cycleTimer()
-                    5 -> toggleCodec()
-                    6 -> pickBitrate()
-                    7 -> toggleDist()
-                    8 -> pickTimelapse()
-                    9 -> pickGrid()
-                    10 -> { levelOn = !levelOn; prefs.edit().putBoolean("level", levelOn).apply(); applyLevel() }
-                    11 -> { zebraOn = !zebraOn; prefs.edit().putBoolean("zebra", zebraOn).apply(); applyAnalysis() }
-                    12 -> { histOn = !histOn; prefs.edit().putBoolean("hist", histOn).apply(); applyAnalysis() }
-                    13 -> curCam?.let { cam ->
+                    4 -> hyperlapse()
+                    5 -> cycleTimer()
+                    6 -> pickInterval()
+                    7 -> pickAudio()
+                    8 -> {
+                        peakOn = !peakOn
+                        prefs.edit().putBoolean("peak", peakOn).apply()
+                        gl.peaking = peakOn && manFocus != null
+                    }
+                    9 -> { lockOnRec = !lockOnRec; prefs.edit().putBoolean("lockRec", lockOnRec).apply() }
+                    10 -> { dimOnRec = !dimOnRec; prefs.edit().putBoolean("dimRec", dimOnRec).apply() }
+                    11 -> toggleCodec()
+                    12 -> pickBitrate()
+                    13 -> toggleDist()
+                    14 -> pickTimelapse()
+                    15 -> pickGrid()
+                    16 -> { levelOn = !levelOn; prefs.edit().putBoolean("level", levelOn).apply(); applyLevel() }
+                    17 -> { zebraOn = !zebraOn; prefs.edit().putBoolean("zebra", zebraOn).apply(); applyAnalysis() }
+                    18 -> { histOn = !histOn; prefs.edit().putBoolean("hist", histOn).apply(); applyAnalysis() }
+                    19 -> curCam?.let { cam ->
                         AlertDialog.Builder(this, DIALOG).setTitle(cam.label)
                             .setMessage(report(cam, curMap)).setPositiveButton("OK", null).show()
                     }
-                    14 -> AlertDialog.Builder(this, DIALOG).setTitle("Все камеры")
+                    20 -> AlertDialog.Builder(this, DIALOG).setTitle("Все камеры")
                         .setItems(cams.map { it.label }.toTypedArray()) { _, j -> selectCam(cams[j]) }
                         .show()
                     else -> AlertDialog.Builder(this, DIALOG).setTitle("Жесты и быстрый запуск")
-                        .setMessage("Тап — фокус и замер света по точке\nДолгий тап — зафиксировать фокус и экспозицию\nДвойной тап — сброс на авто\nДва пальца или колесо — зум\nКнопка громкости — старт/стоп записи\n📷 — фото, в том числе во время записи\nОбъективы и фронталку можно переключать во время записи\n\nБыстрый запуск: опусти шторку → карандаш (изменить) → перетащи плитку «Ширик-камера». Приложение откроется сразу на последнем объективе.")
+                        .setMessage("Тап — фокус и замер света по точке\nДолгий тап — зафиксировать фокус и экспозицию\nДвойной тап — сброс на авто\nДва пальца или колесо — зум\nКнопка громкости — старт/стоп записи\n📷 — фото, в том числе во время записи\n★ — метка во время записи (сохраняются в Documents/WideCam)\nОбъективы и фронталку можно переключать во время записи\n\nБыстрый запуск: опусти шторку → карандаш (изменить) → перетащи плитку «Ширик-камера».")
                         .setPositiveButton("OK", null).show()
                 }
             }.show()
@@ -1788,6 +2082,7 @@ class MainActivity : Activity() {
         // ручные настройки — на авто при смене объектива
         afPoint = null; aeAfLocked = false; evIndex = 0; torch = false; wbLock = false
         manIso = null; manExp = null
+        manFocus = null; gl.peaking = false; focusPanel.visibility = View.GONE
         wbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO
         ring.visibility = View.INVISIBLE; lockLabel.visibility = View.GONE
 
@@ -2019,6 +2314,13 @@ class MainActivity : Activity() {
             b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         }
 
+        // ручной фокус
+        val mf = manFocus
+        if (mf != null && canFocus(c)) {
+            b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            b.set(CaptureRequest.LENS_FOCUS_DISTANCE, mf)
+        }
+
         // баланс белого, фонарь
         b.set(CaptureRequest.CONTROL_AWB_MODE, wbMode)
         b.set(CaptureRequest.CONTROL_AWB_LOCK, wbLock)
@@ -2107,7 +2409,10 @@ class MainActivity : Activity() {
 
     private fun makeRecorder(cfg: Cfg, w: Int, h: Int, fd: java.io.FileDescriptor, audio: Boolean, tl: Float): MediaRecorder {
         val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else @Suppress("DEPRECATION") MediaRecorder()
-        if (audio) r.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+        if (audio) {
+            r.setAudioSource(if (audioMode == 1 && unprocessedOk()) MediaRecorder.AudioSource.UNPROCESSED else MediaRecorder.AudioSource.CAMCORDER)
+            pickMic()?.let { r.setPreferredDevice(it) }
+        }
         r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
         r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
         r.setOutputFile(fd)
@@ -2163,6 +2468,7 @@ class MainActivity : Activity() {
                     activeTargets = listOf(camSurface)
                     activeCfg = cfg
                     if (recording) gl.setMirror(isFront(cfg.cam))
+                    gl.texelX = 1f / cfg.preview.width; gl.texelY = 1f / cfg.preview.height
                     applyControls(afPoint != null && canFocus(cfg.cam.chars))
                     ui { updateReadout() }
                 }
@@ -2271,6 +2577,8 @@ class MainActivity : Activity() {
             }
             val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)!!
             videoUri = uri
+            markers.clear()
+            markerBase = name.removeSuffix(".mp4")
             val fd = contentResolver.openFileDescriptor(uri, "w")!!
             pfd = fd
             // ориентация — по тому, как держат телефон в момент старта; поворот делает OpenGL
@@ -2380,6 +2688,7 @@ class MainActivity : Activity() {
                     put(MediaStore.Video.Media.IS_PENDING, 0)
                 }, null, null)
                 lastVideo = uri
+                saveMarkers(markerBase)
                 setStatus(measure(uri), 6000)
                 loadThumb(uri)
             } else {
