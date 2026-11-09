@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- широкий угол обзора -->
+    <path
+        android:fillColor="#66FFD54F"
+        android:pathData="M54,56 L24,30 Q54,16 84,30 Z" />
+    <!-- корпус объектива -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M34,56 a20,20 0 1,0 40,0 a20,20 0 1,0 -40,0" />
+    <path
+        android:fillColor="#FF1B1F24"
+        android:pathData="M40,56 a14,14 0 1,0 28,0 a14,14 0 1,0 -28,0" />
+    <!-- линза -->
+    <path
+        android:fillColor="#FFFFD54F"
+        android:pathData="M45,56 a9,9 0 1,0 18,0 a9,9 0 1,0 -18,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M48.5,52.5 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+</vector>
