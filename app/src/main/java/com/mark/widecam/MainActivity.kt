@@ -41,6 +41,14 @@ import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaMetadataRetriever
 import android.media.MediaRecorder
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLExt
+import android.opengl.EGLSurface
+import android.opengl.GLES11Ext
+import android.opengl.GLES20
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -73,7 +81,12 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.ceil
@@ -322,6 +335,173 @@ class ZebraView(ctx: Context) : View(ctx) {
     }
 }
 
+/** OpenGL: камера → текстура → превью и кодировщик. Поэтому камеру можно менять во время записи. */
+class GlPipe {
+    private val thread = HandlerThread("gl").apply { start() }
+    private val handler = Handler(thread.looper)
+    private var dpy: EGLDisplay = EGL14.EGL_NO_DISPLAY
+    private var ctx: EGLContext = EGL14.EGL_NO_CONTEXT
+    private var cfg: EGLConfig? = null
+    private var pbuf: EGLSurface = EGL14.EGL_NO_SURFACE
+    private var prevSurf: EGLSurface = EGL14.EGL_NO_SURFACE
+    private var encSurf: EGLSurface = EGL14.EGL_NO_SURFACE
+    private var pw = 0
+    private var ph = 0
+    private var ew = 0
+    private var eh = 0
+    private var encRot = 0f
+    private var encMirror = false
+    private var tex = 0
+    private var prog = 0
+    private var aPos = 0
+    private var aTex = 0
+    private var uST = 0
+    private var uMVP = 0
+    private val st = FloatArray(16)
+    private val mvp = FloatArray(16)
+    private val ident = FloatArray(16)
+    lateinit var camTexture: SurfaceTexture
+    private val quad: FloatBuffer = ByteBuffer.allocateDirect(16 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+        put(floatArrayOf(-1f, -1f, 0f, 0f, 1f, -1f, 1f, 0f, -1f, 1f, 0f, 1f, 1f, 1f, 1f, 1f))
+        position(0)
+    }
+
+    private fun runSync(f: () -> Unit) {
+        val latch = CountDownLatch(1)
+        handler.post {
+            try { f() } catch (_: Exception) {} finally { latch.countDown() }
+        }
+        latch.await(3, TimeUnit.SECONDS)
+    }
+
+    fun start() = runSync {
+        dpy = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        val ver = IntArray(2)
+        EGL14.eglInitialize(dpy, ver, 0, ver, 1)
+        val attrs = intArrayOf(
+            EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT, 0x3142, 1, EGL14.EGL_NONE
+        )
+        val cfgs = arrayOfNulls<EGLConfig>(1)
+        val n = IntArray(1)
+        EGL14.eglChooseConfig(dpy, attrs, 0, cfgs, 0, 1, n, 0)
+        cfg = cfgs[0]
+        ctx = EGL14.eglCreateContext(dpy, cfg, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
+        pbuf = EGL14.eglCreatePbufferSurface(dpy, cfg, intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
+        EGL14.eglMakeCurrent(dpy, pbuf, pbuf, ctx)
+
+        val t = IntArray(1)
+        GLES20.glGenTextures(1, t, 0)
+        tex = t[0]
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        camTexture = SurfaceTexture(tex)
+        camTexture.setOnFrameAvailableListener({ draw() }, handler)
+
+        val vs = "attribute vec4 aPos;\nattribute vec4 aTex;\nuniform mat4 uST;\nuniform mat4 uMVP;\nvarying vec2 vTex;\nvoid main() {\n  gl_Position = uMVP * aPos;\n  vTex = (uST * aTex).xy;\n}\n"
+        val fs = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\nvarying vec2 vTex;\nuniform samplerExternalOES sTex;\nvoid main() {\n  gl_FragColor = texture2D(sTex, vTex);\n}\n"
+        prog = GLES20.glCreateProgram()
+        GLES20.glAttachShader(prog, shader(GLES20.GL_VERTEX_SHADER, vs))
+        GLES20.glAttachShader(prog, shader(GLES20.GL_FRAGMENT_SHADER, fs))
+        GLES20.glLinkProgram(prog)
+        aPos = GLES20.glGetAttribLocation(prog, "aPos")
+        aTex = GLES20.glGetAttribLocation(prog, "aTex")
+        uST = GLES20.glGetUniformLocation(prog, "uST")
+        uMVP = GLES20.glGetUniformLocation(prog, "uMVP")
+        android.opengl.Matrix.setIdentityM(ident, 0)
+    }
+
+    private fun shader(type: Int, src: String): Int {
+        val s = GLES20.glCreateShader(type)
+        GLES20.glShaderSource(s, src)
+        GLES20.glCompileShader(s)
+        return s
+    }
+
+    private fun quadDraw(m: FloatArray) {
+        GLES20.glUseProgram(prog)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
+        GLES20.glUniformMatrix4fv(uST, 1, false, st, 0)
+        GLES20.glUniformMatrix4fv(uMVP, 1, false, m, 0)
+        quad.position(0)
+        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, quad)
+        GLES20.glEnableVertexAttribArray(aPos)
+        quad.position(2)
+        GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 16, quad)
+        GLES20.glEnableVertexAttribArray(aTex)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    private fun draw() {
+        try {
+            EGL14.eglMakeCurrent(dpy, pbuf, pbuf, ctx)
+            camTexture.updateTexImage()
+            camTexture.getTransformMatrix(st)
+            if (prevSurf != EGL14.EGL_NO_SURFACE) {
+                EGL14.eglMakeCurrent(dpy, prevSurf, prevSurf, ctx)
+                GLES20.glViewport(0, 0, pw, ph)
+                quadDraw(ident)
+                EGL14.eglSwapBuffers(dpy, prevSurf)
+            }
+            if (encSurf != EGL14.EGL_NO_SURFACE) {
+                EGL14.eglMakeCurrent(dpy, encSurf, encSurf, ctx)
+                GLES20.glViewport(0, 0, ew, eh)
+                android.opengl.Matrix.setIdentityM(mvp, 0)
+                if (encMirror) android.opengl.Matrix.scaleM(mvp, 0, -1f, 1f, 1f)
+                android.opengl.Matrix.rotateM(mvp, 0, encRot, 0f, 0f, 1f)
+                quadDraw(mvp)
+                EGLExt.eglPresentationTimeANDROID(dpy, encSurf, System.nanoTime())
+                EGL14.eglSwapBuffers(dpy, encSurf)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun drop(s: EGLSurface) {
+        if (s == EGL14.EGL_NO_SURFACE) return
+        EGL14.eglMakeCurrent(dpy, pbuf, pbuf, ctx)
+        EGL14.eglDestroySurface(dpy, s)
+    }
+
+    fun setPreview(s: SurfaceTexture?, w: Int, h: Int) = runSync {
+        drop(prevSurf)
+        prevSurf = EGL14.EGL_NO_SURFACE
+        if (s != null) {
+            prevSurf = EGL14.eglCreateWindowSurface(dpy, cfg, s, intArrayOf(EGL14.EGL_NONE), 0)
+            pw = w; ph = h
+        }
+    }
+
+    fun setPreviewSize(w: Int, h: Int) { handler.post { pw = w; ph = h } }
+
+    fun setEncoder(s: Surface?, w: Int, h: Int, rot: Float, mirror: Boolean) = runSync {
+        drop(encSurf)
+        encSurf = EGL14.EGL_NO_SURFACE
+        if (s != null) {
+            encSurf = EGL14.eglCreateWindowSurface(dpy, cfg, s, intArrayOf(EGL14.EGL_NONE), 0)
+            ew = w; eh = h; encRot = rot; encMirror = mirror
+        }
+    }
+
+    fun setMirror(m: Boolean) { handler.post { encMirror = m } }
+
+    fun release() {
+        runSync {
+            drop(prevSurf); prevSurf = EGL14.EGL_NO_SURFACE
+            drop(encSurf); encSurf = EGL14.EGL_NO_SURFACE
+            EGL14.eglMakeCurrent(dpy, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+            EGL14.eglDestroySurface(dpy, pbuf)
+            camTexture.release()
+            EGL14.eglDestroyContext(dpy, ctx)
+            EGL14.eglTerminate(dpy)
+        }
+        thread.quitSafely()
+    }
+}
+
 class MainActivity : Activity() {
 
     private data class Cam(
@@ -446,10 +626,8 @@ class MainActivity : Activity() {
     @Volatile private var activeCfg: Cfg? = null
     private var activeTemplate = CameraDevice.TEMPLATE_RECORD
     @Volatile private var activeTargets = listOf<Surface>()
-    private var previewSurface: Surface? = null
-    private var recSurface: Surface? = null
-    private var recSurfaceKey = ""
-    @Volatile private var recReady = false
+    private lateinit var gl: GlPipe
+    private lateinit var camSurface: Surface
     private var photoReader: ImageReader? = null
     @Volatile private var photoReady = false
     private var recorder: MediaRecorder? = null
@@ -559,6 +737,9 @@ class MainActivity : Activity() {
         levelOn = prefs.getBoolean("level", true)
         zebraOn = prefs.getBoolean("zebra", false)
         histOn = prefs.getBoolean("hist", false)
+        gl = GlPipe()
+        gl.start()
+        camSurface = Surface(gl.camTexture)
         buildUi()
         grid.mode = prefs.getInt("grid", 0)
         orient = object : OrientationEventListener(this) {
@@ -596,7 +777,7 @@ class MainActivity : Activity() {
         main.removeCallbacks(analyze)
         bg.removeCallbacks(restartTask)
         bg.post {
-            if (recording) stopRec(false)
+            if (recording) stopRec()
             closeCamera()
         }
     }
@@ -604,10 +785,10 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         bg.post {
-            try { recSurface?.release() } catch (_: Exception) {}
             try { photoReader?.close() } catch (_: Exception) {}
         }
         thread.quitSafely()
+        gl.release()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -650,6 +831,22 @@ class MainActivity : Activity() {
         previewBox = FrameLayout(this)
         texture = TextureView(this)
         previewBox.addView(texture, FrameLayout.LayoutParams(MATCH, MATCH))
+        texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                st.setDefaultBufferSize(w, h)
+                gl.setPreview(st, w, h)
+                restartPreview()
+            }
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
+                st.setDefaultBufferSize(w, h)
+                gl.setPreviewSize(w, h)
+            }
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                gl.setPreview(null, 0, 0)
+                return true
+            }
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+        }
         zebra = ZebraView(this)
         previewBox.addView(zebra, FrameLayout.LayoutParams(MATCH, MATCH))
         grid = GridView(this)
@@ -832,8 +1029,7 @@ class MainActivity : Activity() {
         galleryBtn.visibility = if (rec) View.INVISIBLE else View.VISIBLE
         pauseBtn.text = "❚❚"
         val a = if (rec) 0.3f else 1f
-        listOf<View>(resChip, fpsChip, stabChip, lensBar).forEach { it.alpha = a; it.isEnabled = !rec }
-        for (i in 0 until lensBar.childCount) lensBar.getChildAt(i).isEnabled = !rec
+        listOf<View>(resChip, fpsChip, stabChip).forEach { it.alpha = a; it.isEnabled = !rec }
         main.removeCallbacks(tick)
         main.removeCallbacks(meterTask)
         if (rec) {
@@ -951,7 +1147,7 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
                 gravity = Gravity.CENTER
                 background = pill(if (sel) 0x88000000.toInt() else 0x00000000)
-                setOnClickListener { if (!recording) selectCam(l.cam) }
+                setOnClickListener { selectCam(l.cam) }
             }
             lensBar.addView(tv, lp(if (front) dp(64) else dp(48), dp(44)).apply {
                 leftMargin = dp(2); rightMargin = dp(2)
@@ -1170,12 +1366,12 @@ class MainActivity : Activity() {
                         AlertDialog.Builder(this, DIALOG).setTitle(cam.label)
                             .setMessage(report(cam, curMap)).setPositiveButton("OK", null).show()
                     }
-                    9 -> if (recording) setStatus("Нельзя во время записи") else
-                        AlertDialog.Builder(this, DIALOG).setTitle("Все камеры")
+                    9 -> AlertDialog.Builder(this, DIALOG).setTitle("Все камеры")
                             .setItems(cams.map { it.label }.toTypedArray()) { _, j -> selectCam(cams[j]) }
                             .show()
                     else -> AlertDialog.Builder(this, DIALOG).setTitle("Жесты")
-                        .setMessage("Тап — фокус и замер света по точке\nДолгий тап — зафиксировать фокус и экспозицию\nДвойной тап — сброс на авто\nДва пальца или колесо — зум\nКнопка громкости — старт/стоп записи\n📷 — фото, в том числе во время записи")
+                        .setMessage("Тап — фокус и замер света по точке\nДолгий тап — зафиксировать фокус и экспозицию\nДвойной тап — сброс на авто\nДва пальца или колесо — зум\nКнопка громкости — старт/стоп записи\n📷 — фото, в том числе во время записи
+Объективы и фронталку можно переключать прямо во время записи")
                         .setPositiveButton("OK", null).show()
                 }
             }.show()
@@ -1193,13 +1389,6 @@ class MainActivity : Activity() {
         }
         if (cams.isEmpty()) { setStatus("Камеры не найдены", 10000); return }
         buildLenses()
-
-        texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) = restartPreview()
-            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
-            override fun onSurfaceTextureDestroyed(st: SurfaceTexture) = true
-            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
-        }
 
         val saved = prefs.getString("cam", null)
         val start = cams.firstOrNull { it.key == saved } ?: lenses.firstOrNull()?.cam ?: cams[0]
@@ -1307,14 +1496,21 @@ class MainActivity : Activity() {
         for (r in listOf(Range(60, 60), Range(30, 30))) if (r !in supportedFps) fl += r
         fpsRanges = fl
 
-        val savedSize = prefs.getString("size_" + cam.key, null)
-            ?.let { try { Size.parseSize(it) } catch (e: Exception) { null } }
-        curSize = savedSize?.takeIf { it in list }
-            ?: Size(1920, 1080).takeIf { it in supportedSizes }
-            ?: real.filter { it.width * it.height <= 1920 * 1080 }.maxByOrNull { it.width * it.height }
-            ?: list.first()
-        val savedFps = prefs.getString("fps_" + cam.key, null)?.let { parseRange(it) }
-        curFps = savedFps?.takeIf { it in fl } ?: bestFps()
+        if (recording) {
+            // во время записи размер кадра не меняем, частоту подбираем под новую камеру
+            if (curFps !in supportedFps)
+                curFps = supportedFps.filter { it.upper <= curFps.upper }.maxByOrNull { it.upper } ?: bestFps()
+            setStatus("Переключаю объектив…", 1200)
+        } else {
+            val savedSize = prefs.getString("size_" + cam.key, null)
+                ?.let { try { Size.parseSize(it) } catch (e: Exception) { null } }
+            curSize = savedSize?.takeIf { it in list }
+                ?: Size(1920, 1080).takeIf { it in supportedSizes }
+                ?: real.filter { it.width * it.height <= 1920 * 1080 }.maxByOrNull { it.width * it.height }
+                ?: list.first()
+            val savedFps = prefs.getString("fps_" + cam.key, null)?.let { parseRange(it) }
+            curFps = savedFps?.takeIf { it in fl } ?: bestFps()
+        }
 
         // ручные настройки — на авто при смене объектива
         afPoint = null; aeAfLocked = false; evIndex = 0; torch = false; wbLock = false
@@ -1364,7 +1560,7 @@ class MainActivity : Activity() {
         val labels = sizes.map { s ->
             if (s in supportedSizes)
                 sizeName(s) + "   " + s.width + "×" + s.height + "   до " + (maxFps(curMap, s) ?: "?") + " к/с"
-            else sizeName(s) + "   нет в драйвере — попробовать силой"
+            else sizeName(s) + "   нет в драйвере — растяну из меньшего (не честное)"
         }
         AlertDialog.Builder(this, DIALOG).setTitle("Разрешение")
             .setItems(labels.toTypedArray()) { _, i ->
@@ -1432,12 +1628,14 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Размер кадра, который отдаёт камера (дальше OpenGL масштабирует его в превью и в запись). */
     private fun previewSizeFor(cam: Cam, target: Size): Size {
         val all = streamMap(cam)?.getOutputSizes(SurfaceTexture::class.java)?.toList() ?: emptyList()
+        if (target in all) return target
         val ratio = target.width.toFloat() / target.height
-        return all.filter {
-            abs(it.width.toFloat() / it.height - ratio) < 0.02f && it.width * it.height <= 1920 * 1080
-        }.maxByOrNull { it.width * it.height }
+        val same = all.filter { abs(it.width.toFloat() / it.height - ratio) < 0.02f }
+        return same.filter { it.width * it.height <= target.width * target.height }.maxByOrNull { it.width * it.height }
+            ?: same.minByOrNull { it.width * it.height }
             ?: all.filter { it.width * it.height <= 1920 * 1080 }.maxByOrNull { it.width * it.height }
             ?: Size(1280, 720)
     }
@@ -1453,7 +1651,6 @@ class MainActivity : Activity() {
     }
 
     private fun restartPreview() {
-        if (recording) return
         if (!captureCfg()) return
         bg.removeCallbacks(restartTask)
         bg.postDelayed(restartTask, 200)
@@ -1465,7 +1662,7 @@ class MainActivity : Activity() {
         try { session?.close() } catch (_: Exception) {}
         session = null
         activeCfg = null
-        recReady = false; photoReady = false
+        photoReady = false
         try { device?.close() } catch (_: Exception) {}
         device = null
         deviceId = null
@@ -1595,13 +1792,12 @@ class MainActivity : Activity() {
     @SuppressLint("MissingPermission")
     private fun doRestart() {
         val cfg = pending ?: return
-        val st = texture.surfaceTexture ?: return
         try { session?.close() } catch (_: Exception) {}
         session = null
         activeCfg = null
 
         if (device != null && deviceId == cfg.cam.openId) {
-            createSession(cfg, st, true, true)
+            createSession(cfg, true)
             return
         }
         closeCamera()
@@ -1609,16 +1805,19 @@ class MainActivity : Activity() {
             mgr.openCamera(cfg.cam.openId, exec, object : CameraDevice.StateCallback() {
                 override fun onOpened(d: CameraDevice) {
                     device = d; deviceId = cfg.cam.openId
-                    createSession(cfg, st, true, true)
+                    createSession(cfg, true)
                 }
                 override fun onDisconnected(d: CameraDevice) {
                     d.close(); if (device == d) { device = null; deviceId = null }
                 }
                 override fun onError(d: CameraDevice, error: Int) {
                     d.close(); if (device == d) { device = null; deviceId = null }
-                    if (recording) abortRecorder()
-                    setStatus("Драйвер не выдержал режим " + sizeName(cfg.size) + " · " + fpsName(cfg.fps) + " (код $error) — включил рабочий", 6000)
-                    ui { fallbackIfForced() }
+                    if (recording) {
+                        setStatus("Эта камера не открылась (код $error) — запись идёт, переключись обратно", 6000)
+                    } else {
+                        setStatus("Драйвер не выдержал режим " + sizeName(cfg.size) + " · " + fpsName(cfg.fps) + " (код $error) — включил рабочий", 6000)
+                        ui { fallbackIfForced() }
+                    }
                 }
             })
         } catch (e: Exception) {
@@ -1633,14 +1832,14 @@ class MainActivity : Activity() {
         return v.coerceIn(4_000_000L, 160_000_000L).toInt()
     }
 
-    private fun makeRecorder(cfg: Cfg, surface: Surface, fd: java.io.FileDescriptor?, path: String?, audio: Boolean, tl: Float): MediaRecorder {
+    private fun makeRecorder(cfg: Cfg, w: Int, h: Int, fd: java.io.FileDescriptor, audio: Boolean, tl: Float): MediaRecorder {
         val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else @Suppress("DEPRECATION") MediaRecorder()
         if (audio) r.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
         r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
         r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-        if (fd != null) r.setOutputFile(fd) else if (path != null) r.setOutputFile(path)
+        r.setOutputFile(fd)
         r.setVideoEncoder(if (codecHevc) MediaRecorder.VideoEncoder.HEVC else MediaRecorder.VideoEncoder.H264)
-        r.setVideoSize(cfg.size.width, cfg.size.height)
+        r.setVideoSize(w, h)
         r.setVideoFrameRate(if (tl > 0f) 30 else cfg.fps.upper)
         if (tl > 0f) r.setCaptureRate(tl.toDouble())
         r.setVideoEncodingBitRate(bitrateFor(cfg))
@@ -1649,27 +1848,7 @@ class MainActivity : Activity() {
             r.setAudioSamplingRate(48000)
             r.setAudioEncodingBitRate(192_000)
         }
-        r.setInputSurface(surface)
         return r
-    }
-
-    /** Постоянная поверхность кодировщика: живёт в сессии всё время, поэтому запись стартует мгновенно. */
-    private fun recSurfaceFor(cfg: Cfg): Surface? {
-        val key = "" + cfg.size + "/" + cfg.fps.upper + "/" + codecHevc
-        val cur = recSurface
-        if (cur != null && key == recSurfaceKey) return cur
-        try { cur?.release() } catch (_: Exception) {}
-        recSurface = null; recSurfaceKey = ""
-        return try {
-            val s = MediaCodec.createPersistentInputSurface()
-            val f = File(cacheDir, "probe.mp4")
-            val r = makeRecorder(cfg, s, null, f.absolutePath, false, 0f)
-            r.prepare(); r.release(); f.delete()
-            recSurface = s; recSurfaceKey = key
-            s
-        } catch (e: Exception) {
-            null
-        }
     }
 
     private fun photoReaderFor(cfg: Cfg): ImageReader? {
@@ -1690,21 +1869,13 @@ class MainActivity : Activity() {
         return r
     }
 
-    private fun isForced(cfg: Cfg) = cfg.size !in supportedSizes || cfg.fps !in supportedFps
+    private fun isFront(cam: Cam) = facing(cam.chars) == CameraCharacteristics.LENS_FACING_FRONT
 
-    private fun createSession(cfg: Cfg, st: SurfaceTexture, withPhoto: Boolean, withRec: Boolean) {
+    private fun createSession(cfg: Cfg, withPhoto: Boolean) {
         val d = device ?: return
-        st.setDefaultBufferSize(cfg.preview.width, cfg.preview.height)
-        val preview = Surface(st)
-        val rs = if (withRec) recSurfaceFor(cfg) else null
-        if (withRec && rs == null && isForced(cfg)) {
-            setStatus("Кодировщик не принял режим " + sizeName(cfg.size) + " · " + fpsName(cfg.fps) + " — включил рабочий", 6000)
-            ui { fallbackIfForced() }
-            return
-        }
+        gl.camTexture.setDefaultBufferSize(cfg.preview.width, cfg.preview.height)
         val jr = if (withPhoto) photoReaderFor(cfg) else null
-        val surfaces = mutableListOf(preview)
-        if (rs != null) surfaces += rs
+        val surfaces = mutableListOf(camSurface)
         if (jr != null) surfaces += jr.surface
         val mode = sizeName(cfg.size) + " · " + fpsName(cfg.fps)
         val outs = surfaces.map { s ->
@@ -1714,26 +1885,19 @@ class MainActivity : Activity() {
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
-                    previewSurface = preview
-                    recReady = rs != null
                     photoReady = jr != null
                     activeTemplate = CameraDevice.TEMPLATE_RECORD
-                    activeTargets = listOf(preview)
+                    activeTargets = listOf(camSurface)
                     activeCfg = cfg
+                    if (recording) gl.setMirror(isFront(cfg.cam))
                     applyControls(afPoint != null && canFocus(cfg.cam.chars))
                     ui { updateReadout() }
-                    if (rs == null) setStatus("Запись в режиме $mode недоступна — драйвер не принял", 5000)
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    when {
-                        jr != null -> createSession(cfg, st, false, withRec)
-                        rs != null && !isForced(cfg) -> createSession(cfg, st, false, false)
-                        else -> {
-                            setStatus("Драйвер не поддерживает режим $mode — включил рабочий", 6000)
-                            ui { fallbackIfForced() }
-                        }
-                    }
+                    if (jr != null) { createSession(cfg, false); return }
+                    setStatus("Драйвер не поддерживает режим $mode — включил рабочий", 6000)
+                    ui { fallbackIfForced() }
                 }
             })
         try {
@@ -1808,17 +1972,13 @@ class MainActivity : Activity() {
     // ---------- запись ----------
 
     private fun toggleRec() {
-        if (!recording) bg.post { startRec() } else bg.post { stopRec(true) }
+        if (!recording) bg.post { startRec() } else bg.post { stopRec() }
     }
 
     private fun startRec() {
         if (recording) return
-        val s = session
         val cfg = activeCfg
-        val rs = recSurface
-        if (s == null || cfg == null || rs == null || !recReady) {
-            setStatus("Запись в этом режиме недоступна", 4000); return
-        }
+        if (cfg == null) { setStatus("Камера ещё не готова", 3000); return }
         try {
             val name = "WideCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
             val values = ContentValues().apply {
@@ -1831,20 +1991,20 @@ class MainActivity : Activity() {
             videoUri = uri
             val fd = contentResolver.openFileDescriptor(uri, "w")!!
             pfd = fd
+            // ориентация — по тому, как держат телефон в момент старта; поворот делает OpenGL
+            val portrait = devOrient == 0 || devOrient == 180
+            val vw = if (portrait) cfg.size.height else cfg.size.width
+            val vh = if (portrait) cfg.size.width else cfg.size.height
             val tl = timelapseRate()
-            val r = makeRecorder(cfg, rs, fd.fileDescriptor, null, tl <= 0f, tl)
-            r.setOrientationHint(orientationFor(cfg))
+            val r = makeRecorder(cfg, vw, vh, fd.fileDescriptor, tl <= 0f, tl)
             r.prepare()
             recorder = r
-            activeTargets = listOfNotNull(previewSurface, rs)
-            applyControls(false)
             r.start()
             recording = true
+            gl.setEncoder(r.surface, vw, vh, -devOrient.toFloat(), isFront(cfg.cam))
             setRecUi(true)
         } catch (e: Exception) {
             setStatus("Запись не запустилась: " + e.message, 6000)
-            activeTargets = listOfNotNull(previewSurface)
-            applyControls(false)
             abortRecorder()
         }
     }
@@ -1906,6 +2066,7 @@ class MainActivity : Activity() {
     }
 
     private fun abortRecorder() {
+        gl.setEncoder(null, 0, 0, 0f, false)
         recording = false
         paused = false
         try { recorder?.release() } catch (_: Exception) {}
@@ -1917,13 +2078,11 @@ class MainActivity : Activity() {
         setRecUi(false)
     }
 
-    private fun stopRec(keepPreview: Boolean) {
+    private fun stopRec() {
         if (!recording) return
         recording = false
         paused = false
-        activeTargets = listOfNotNull(previewSurface)
-        if (keepPreview) applyControls(false)
-        else try { session?.stopRepeating() } catch (_: Exception) {}
+        gl.setEncoder(null, 0, 0, 0f, false)
         var ok = true
         try { recorder?.stop() } catch (e: Exception) { ok = false }
         try { recorder?.release() } catch (_: Exception) {}
