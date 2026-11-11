@@ -32,6 +32,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
@@ -431,6 +432,16 @@ class GlPipe {
     @Volatile var aspect1 = 0.5625f
     @Volatile var aspect2 = 0.5625f
     @Volatile var mirror2 = false
+    @Volatile var desq = 1f
+    @Volatile var prevLand = false
+    @Volatile var previewEvery = 1
+    private var frameNo = 0L
+    private var lutTex = 0
+    @Volatile var lutOn = false
+    @Volatile var lutN = 33f
+    private var uLut = 0
+    private var uLutN = 0
+    private var uLutOn = 0
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(16 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
         put(floatArrayOf(-1f, -1f, 0f, 0f, 1f, -1f, 1f, 0f, -1f, 1f, 0f, 1f, 1f, 1f, 1f, 1f))
         position(0)
@@ -482,7 +493,7 @@ class GlPipe {
         camTexture2.setOnFrameAvailableListener({ cam2Fresh = true }, handler)
 
         val vs = "attribute vec4 aPos;\nattribute vec4 aTex;\nuniform mat4 uST;\nuniform mat4 uMVP;\nvarying vec2 vTex;\nvoid main() {\n  gl_Position = uMVP * aPos;\n  vTex = (uST * aTex).xy;\n}\n"
-        val fs = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\nvarying vec2 vTex;\nuniform samplerExternalOES sTex;\nuniform int uProf;\nuniform int uPeak;\nuniform vec2 uTexel;\nvec3 sat(vec3 c, float s) { float l = dot(c, vec3(0.299, 0.587, 0.114)); return mix(vec3(l), c, s); }\nvec3 con(vec3 c, float k) { return (c - 0.5) * k + 0.5; }\nvoid main() {\n  vec3 c = texture2D(sTex, vTex).rgb;\n  if (uProf == 1) { c = con(c, 0.78) + 0.03; c = sat(c, 0.8); }\n  else if (uProf == 2) { c = sat(c, 0.85); c = con(c, 1.12); float l = dot(c, vec3(0.299, 0.587, 0.114)); c += vec3(0.05, 0.0, -0.05) * (l - 0.5) * 2.0; }\n  else if (uProf == 3) { c = sat(c, 1.3); c = con(c, 1.08); }\n  else if (uProf == 4) { float l = dot(c, vec3(0.299, 0.587, 0.114)); c = con(vec3(l), 1.15); }\n  if (uPeak == 1) {\n    float l0 = dot(texture2D(sTex, vTex).rgb, vec3(0.299, 0.587, 0.114));\n    float lx = dot(texture2D(sTex, vTex + vec2(uTexel.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n    float ly = dot(texture2D(sTex, vTex + vec2(0.0, uTexel.y)).rgb, vec3(0.299, 0.587, 0.114));\n    if (abs(lx - l0) + abs(ly - l0) > 0.12) c = vec3(1.0, 0.15, 0.15);\n  }\n  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);\n}\n"
+        val fs = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\nvarying vec2 vTex;\nuniform samplerExternalOES sTex;\nuniform int uProf;\nuniform int uPeak;\nuniform vec2 uTexel;\nuniform sampler2D uLut;\nuniform float uLutN;\nuniform int uLutOn;\nvec3 sat(vec3 c, float s) { float l = dot(c, vec3(0.299, 0.587, 0.114)); return mix(vec3(l), c, s); }\nvec3 con(vec3 c, float k) { return (c - 0.5) * k + 0.5; }\nvec3 lut(vec3 c) { float n = uLutN; float b = c.b * (n - 1.0); float b0 = floor(b); float b1 = min(b0 + 1.0, n - 1.0); float f = b - b0; float x = c.r * (n - 1.0) + 0.5; float y = (c.g * (n - 1.0) + 0.5) / n; vec3 a0 = texture2D(uLut, vec2((b0 * n + x) / (n * n), y)).rgb; vec3 a1 = texture2D(uLut, vec2((b1 * n + x) / (n * n), y)).rgb; return mix(a0, a1, f); }\nvoid main() {\n  vec3 c = texture2D(sTex, vTex).rgb;\n  if (uProf == 1) { c = con(c, 0.78) + 0.03; c = sat(c, 0.8); }\n  else if (uProf == 2) { c = sat(c, 0.85); c = con(c, 1.12); float l = dot(c, vec3(0.299, 0.587, 0.114)); c += vec3(0.05, 0.0, -0.05) * (l - 0.5) * 2.0; }\n  else if (uProf == 3) { c = sat(c, 1.3); c = con(c, 1.08); }\n  else if (uProf == 4) { float l = dot(c, vec3(0.299, 0.587, 0.114)); c = con(vec3(l), 1.15); }\n  if (uLutOn == 1) c = lut(clamp(c, 0.0, 1.0));\n  if (uPeak == 1) {\n    float l0 = dot(texture2D(sTex, vTex).rgb, vec3(0.299, 0.587, 0.114));\n    float lx = dot(texture2D(sTex, vTex + vec2(uTexel.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n    float ly = dot(texture2D(sTex, vTex + vec2(0.0, uTexel.y)).rgb, vec3(0.299, 0.587, 0.114));\n    if (abs(lx - l0) + abs(ly - l0) > 0.12) c = vec3(1.0, 0.15, 0.15);\n  }\n  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);\n}\n"
         prog = GLES20.glCreateProgram()
         GLES20.glAttachShader(prog, shader(GLES20.GL_VERTEX_SHADER, vs))
         GLES20.glAttachShader(prog, shader(GLES20.GL_FRAGMENT_SHADER, fs))
@@ -494,6 +505,9 @@ class GlPipe {
         uProf = GLES20.glGetUniformLocation(prog, "uProf")
         uPeak = GLES20.glGetUniformLocation(prog, "uPeak")
         uTexel = GLES20.glGetUniformLocation(prog, "uTexel")
+        uLut = GLES20.glGetUniformLocation(prog, "uLut")
+        uLutN = GLES20.glGetUniformLocation(prog, "uLutN")
+        uLutOn = GLES20.glGetUniformLocation(prog, "uLutOn")
         android.opengl.Matrix.setIdentityM(ident, 0)
     }
 
@@ -506,6 +520,14 @@ class GlPipe {
 
     private fun quadDraw(m: FloatArray, peak: Boolean = false, t: Int = tex, stm: FloatArray = st) {
         GLES20.glUseProgram(prog)
+        val useLut = lutOn && lutTex != 0
+        if (useLut) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTex)
+            GLES20.glUniform1i(uLut, 1)
+            GLES20.glUniform1f(uLutN, lutN)
+        }
+        GLES20.glUniform1i(uLutOn, if (useLut) 1 else 0)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, t)
         GLES20.glUniformMatrix4fv(uST, 1, false, stm, 0)
@@ -533,14 +555,15 @@ class GlPipe {
                 camTexture2.getTransformMatrix(st2)
             }
             computeCorr()
-            if (prevSurf != EGL14.EGL_NO_SURFACE) {
+            frameNo++
+            if (prevSurf != EGL14.EGL_NO_SURFACE && frameNo % max(1, previewEvery) == 0L) {
                 EGL14.eglMakeCurrent(dpy, prevSurf, prevSurf, ctx)
-                compose(pw, ph, 0f, false, false, peaking)
+                compose(pw, ph, 0f, false, false, peaking, if (prevLand) 1f / desq else desq)
                 EGL14.eglSwapBuffers(dpy, prevSurf)
             }
             if (encSurf != EGL14.EGL_NO_SURFACE) {
                 EGL14.eglMakeCurrent(dpy, encSurf, encSurf, ctx)
-                compose(ew, eh, encRot, encMirror, mirror2, false)
+                compose(ew, eh, encRot, encMirror, mirror2, false, desq)
                 EGLExt.eglPresentationTimeANDROID(dpy, encSurf, System.nanoTime())
                 EGL14.eglSwapBuffers(dpy, encSurf)
             }
@@ -548,7 +571,7 @@ class GlPipe {
     }
 
     /** Кадр целиком: основная камера + (если включено) вторая — окном или пополам. */
-    private fun compose(fw: Int, fh: Int, rot: Float, mirror: Boolean, mirrorB: Boolean, peak: Boolean) {
+    private fun compose(fw: Int, fh: Int, rot: Float, mirror: Boolean, mirrorB: Boolean, peak: Boolean, dq: Float) {
         GLES20.glViewport(0, 0, fw, fh)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
@@ -556,16 +579,16 @@ class GlPipe {
         if (second && dual == 2) {
             if (fw >= fh) {
                 val hw = fw / 2
-                drawFill(tex, st, 0, 0, hw, fh, aspect1, rot, mirror, true, peak)
+                drawFill(tex, st, 0, 0, hw, fh, aspect1, rot, mirror, true, peak, dq)
                 drawFill(tex2, st2, hw, 0, fw - hw, fh, aspect2, rot, mirrorB, false, false)
             } else {
                 val hh = fh / 2
-                drawFill(tex, st, 0, hh, fw, fh - hh, aspect1, rot, mirror, true, peak)
+                drawFill(tex, st, 0, hh, fw, fh - hh, aspect1, rot, mirror, true, peak, dq)
                 drawFill(tex2, st2, 0, 0, fw, hh, aspect2, rot, mirrorB, false, false)
             }
             return
         }
-        drawFill(tex, st, 0, 0, fw, fh, aspect1, rot, mirror, true, peak)
+        drawFill(tex, st, 0, 0, fw, fh, aspect1, rot, mirror, true, peak, dq)
         if (second && dual == 1) {
             val ca = if (abs(rot % 180f) > 1f) 1f / aspect2 else aspect2
             val short = 0.32f * min(fw, fh)
@@ -586,10 +609,10 @@ class GlPipe {
     }
 
     /** Рисует картинку камеры в прямоугольник с обрезкой по краям (без растягивания). */
-    private fun drawFill(t: Int, stm: FloatArray, vx: Int, vy: Int, vw: Int, vh: Int, a: Float, rot: Float, mirror: Boolean, useCorr: Boolean, peak: Boolean) {
+    private fun drawFill(t: Int, stm: FloatArray, vx: Int, vy: Int, vw: Int, vh: Int, a: Float, rot: Float, mirror: Boolean, useCorr: Boolean, peak: Boolean, dq: Float = 1f) {
         if (vw <= 0 || vh <= 0) return
         GLES20.glViewport(vx, vy, vw, vh)
-        val ca = if (abs(rot % 180f) > 1f) 1f / a else a
+        val ca = (if (abs(rot % 180f) > 1f) 1f / a else a) * dq
         val va = vw.toFloat() / vh
         var sx = 1f
         var sy = 1f
@@ -646,6 +669,37 @@ class GlPipe {
     }
 
     fun setMirror(m: Boolean) { handler.post { encMirror = m } }
+
+    /** Загружаем 3D LUT как плоскую текстуру: срезы по синему каналу идут слева направо. */
+    fun setLut(data: ByteArray?, n: Int) {
+        handler.post {
+            try {
+                if (data == null || n < 2) { lutOn = false; return@post }
+                EGL14.eglMakeCurrent(dpy, pbuf, pbuf, ctx)
+                if (lutTex == 0) {
+                    val a = IntArray(1)
+                    GLES20.glGenTextures(1, a, 0)
+                    lutTex = a[0]
+                }
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTex)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
+                val buf = ByteBuffer.allocateDirect(data.size).order(ByteOrder.nativeOrder())
+                buf.put(data)
+                buf.position(0)
+                GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGB, n * n, n, 0, GLES20.GL_RGB, GLES20.GL_UNSIGNED_BYTE, buf)
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                lutN = n.toFloat()
+                lutOn = true
+            } catch (_: Exception) {
+                lutOn = false
+            }
+        }
+    }
 
     fun release() {
         runSync {
@@ -750,6 +804,7 @@ class MainActivity : Activity() {
     private lateinit var formatChip: TextView
     private lateinit var shotChip: TextView
     private lateinit var dualChip: TextView
+    private lateinit var slowChip: TextView
     private lateinit var cam2Surface: Surface
     private lateinit var settingsBtn: TextView
     private lateinit var wheel: ZoomWheel
@@ -827,6 +882,12 @@ class MainActivity : Activity() {
     private val shotShort = listOf("обычное", "брекетинг", "HDR", "ночь", "длинная ×16", "длинная ×32", "фокус-брекетинг")
     private var shotMode = 0
     private var dualMode = 0
+    @Volatile private var slowFps = 0
+    private var slowSize: Size? = null
+    private var anamorph = 1f
+    @Volatile private var lutF: FloatArray? = null
+    private var lutNcpu = 0
+    private var lutName = ""
     private var dualFailed = false
     @Volatile private var dev2: CameraDevice? = null
     @Volatile private var ses2: CameraCaptureSession? = null
@@ -1055,6 +1116,9 @@ class MainActivity : Activity() {
         geoOn = prefs.getBoolean("geo", false)
         dualMode = prefs.getInt("dual", 0).coerceIn(0, 2)
         gl.dual = dualMode
+        anamorph = prefs.getFloat("anam", 1f)
+        gl.desq = anamorph
+        bg.post { loadSavedLut() }
         applyModeUi()
         orient = object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
@@ -1247,9 +1311,10 @@ class MainActivity : Activity() {
         formatChip = chip().apply { visibility = View.GONE; setOnClickListener { toggleRaw() } }
         shotChip = chip().apply { visibility = View.GONE; setOnClickListener { pickShotMode() } }
         dualChip = chip().apply { setOnClickListener { pickDual() } }
+        slowChip = chip().apply { setOnClickListener { pickSlow() } }
         starChip = chip().apply { text = "★ Метка"; setTextColor(YELLOW); visibility = View.GONE; setOnClickListener { addMarker() } }
         settingsBtn = chip().apply { text = "⚙"; textSize = 17f; setOnClickListener { showSettings() } }
-        listOf(starChip, shotChip, resChip, formatChip, fpsChip, focusChip, isoChip, shutterChip, wbChip, evChip, profileChip, stabChip, horizonChip, dualChip, timerChip, torchChip, settingsBtn)
+        listOf(starChip, shotChip, resChip, formatChip, fpsChip, slowChip, focusChip, isoChip, shutterChip, wbChip, evChip, profileChip, stabChip, horizonChip, dualChip, timerChip, torchChip, settingsBtn)
             .forEachIndexed { i, v -> row.addView(v, lp(WRAP, WRAP).apply { if (i > 0) leftMargin = dp(8) }) }
         val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
         scroll.addView(row, FrameLayout.LayoutParams(WRAP, MATCH))
@@ -1419,6 +1484,7 @@ class MainActivity : Activity() {
     private fun rotateUi(r: Int) = ui {
         val deg = uiDeg(r)
         guide.landscape = r == 90 || r == 270
+        gl.prevLand = r == 90 || r == 270
         guide.invalidate()
         val views = mutableListOf<View>(settingsBtn, pauseBtn, galleryBtn, photoBtn)
         for (i in 0 until lensBar.childCount) views += lensBar.getChildAt(i)
@@ -1440,7 +1506,7 @@ class MainActivity : Activity() {
         d.cornerRadius = if (rec) dp(8).toFloat() else dp(30).toFloat()
         recInner.layoutParams = (recInner.layoutParams as FrameLayout.LayoutParams).apply { width = size; height = size }
         timerText.visibility = if (rec) View.VISIBLE else View.GONE
-        meter.visibility = if (rec && tlIndex == 0) View.VISIBLE else View.GONE
+        meter.visibility = if (rec && tlIndex == 0 && slowFps == 0) View.VISIBLE else View.GONE
         (timerText.background as GradientDrawable).setColor(RED)
         pauseBtn.visibility = if (rec) View.VISIBLE else View.GONE
         galleryBtn.visibility = if (rec) View.INVISIBLE else View.VISIBLE
@@ -1457,7 +1523,7 @@ class MainActivity : Activity() {
             recStart = SystemClock.elapsedRealtime(); pausedTotal = 0L; paused = false
             timerText.text = "● 00:00"
             main.post(tick)
-            if (tlIndex == 0) main.post(meterTask)
+            if (tlIndex == 0 && slowFps == 0) main.post(meterTask)
         }
     }
 
@@ -1531,15 +1597,17 @@ class MainActivity : Activity() {
         evChip.text = if (isManual()) "EV —" else "EV " + evName(evIndex)
         evChip.setTextColor(if (!isManual() && evIndex != 0) YELLOW else Color.WHITE)
         torchChip.setTextColor(if (torch) YELLOW else Color.WHITE)
-        tlBadge.text = "ТАЙМЛАПС " + tlName().substringAfter("(").removeSuffix(")") + " · без звука"
-        tlBadge.visibility = if (tlIndex > 0 && !photoMode) View.VISIBLE else View.GONE
+        tlBadge.text = if (slowFps > 0) "СЛОУМО ×" + (slowFps / 30) + " · без звука" else "ТАЙМЛАПС " + tlName().substringAfter("(").removeSuffix(")") + " · без звука"
+        tlBadge.visibility = if ((tlIndex > 0 || slowFps > 0) && !photoMode) View.VISIBLE else View.GONE
+        slowChip.text = if (slowFps > 0) "Слоумо " + slowFps else "Слоумо"
+        slowChip.setTextColor(if (slowFps > 0) YELLOW else Color.WHITE)
         formatChip.text = if (rawOn) "RAW+JPEG" else "JPEG"
         formatChip.setTextColor(if (rawOn) YELLOW else Color.WHITE)
         shotChip.text = "Режим: " + shotShort[shotMode]
         dualChip.text = when (dualMode) { 1 -> "2 камеры: окно"; 2 -> "2 камеры: пополам"; else -> "2 камеры" }
         dualChip.setTextColor(if (dualMode != 0) YELLOW else Color.WHITE)
         shotChip.setTextColor(if (shotMode != 0) YELLOW else Color.WHITE)
-        profileChip.text = "Цвет: " + profileShort[profile]
+        profileChip.text = "Цвет: " + profileShort[profile] + (if (lutF != null) " + LUT" else "")
         profileChip.setTextColor(if (profile != 0) YELLOW else Color.WHITE)
         horizonChip.setTextColor(if (horizonLock) YELLOW else Color.WHITE)
         timerChip.text = if (timerSec == 0) "⏱ выкл" else "⏱ " + timerSec + " с"
@@ -2037,7 +2105,7 @@ class MainActivity : Activity() {
 
     private fun applyModeUi() {
         val v = if (photoMode) View.GONE else View.VISIBLE
-        listOf<View>(fpsChip, profileChip, horizonChip).forEach { it.visibility = v }
+        listOf<View>(fpsChip, slowChip, profileChip, horizonChip).forEach { it.visibility = v }
         formatChip.visibility = if (photoMode) View.VISIBLE else View.GONE
         shotChip.visibility = if (photoMode) View.VISIBLE else View.GONE
         photoBtn.text = if (photoMode) "🎥" else "📷"
@@ -2299,6 +2367,8 @@ class MainActivity : Activity() {
             "Выбрать камеру вручную",
             "Зеркальное видео с фронталки: " + onOff(mirrorFront),
             "Геометки в фото и видео: " + onOff(geoOn),
+            "LUT (.cube): " + (if (lutF != null) lutName else "выкл"),
+            "Анаморфная насадка: " + (if (anamorph > 1.01f) String.format(Locale.US, "%.2f×", anamorph) else "выкл"),
             "Жесты и быстрый запуск"
         )
         AlertDialog.Builder(this, DIALOG).setTitle("Настройки")
@@ -2341,6 +2411,8 @@ class MainActivity : Activity() {
                         setStatus(if (mirrorFront) "Видео с фронталки — зеркальное, как в зеркале" else "Видео с фронталки — как в жизни, текст читается", 2500)
                     }
                     23 -> toggleGeo()
+                    24 -> pickLut()
+                    25 -> pickAnamorph()
                     else -> AlertDialog.Builder(this, DIALOG).setTitle("Жесты и быстрый запуск")
                         .setMessage("Тап — фокус и замер света по точке\nДолгий тап — зафиксировать фокус и экспозицию\nДвойной тап — сброс на авто\nДва пальца или колесо — зум\nКнопка громкости — старт/стоп записи\n📷 — фото, в том числе во время записи\n★ — метка во время записи (сохраняются в Documents/WideCam)\nОбъективы и фронталку можно переключать во время записи\n\nБыстрый запуск: опусти шторку → карандаш (изменить) → перетащи плитку «Ширик-камера».")
                         .setPositiveButton("OK", null).show()
@@ -2453,6 +2525,8 @@ class MainActivity : Activity() {
     }
 
     private fun selectCam(cam: Cam, startZoom: Float = 1f) {
+        if (recording && slowFps > 0) { setStatus("Во время слоумо объектив не переключается", 2000); return }
+        if (!recording && slowFps > 0) { slowFps = 0; slowSize = null; gl.previewEvery = 1 }
         curCam = cam
         gl.frontCam = false
         prefs.edit().putString("cam", cam.key).apply()
@@ -2626,9 +2700,11 @@ class MainActivity : Activity() {
 
     private fun captureCfg(): Boolean {
         val cam = curCam ?: return false
-        val size = if (photoMode) curPhotoSize else curSize
-        val fps = if (photoMode) photoFps() else curFps
-        val prev = if (photoMode) photoPreviewSize(cam, size) else previewSizeFor(cam, size)
+        val ss = slowSize
+        val slow = !photoMode && slowFps > 0 && ss != null
+        val size = if (photoMode) curPhotoSize else if (slow && ss != null) ss else curSize
+        val fps = if (photoMode) photoFps() else if (slow) Range(slowFps, slowFps) else curFps
+        val prev = if (photoMode) photoPreviewSize(cam, size) else if (slow) size else previewSizeFor(cam, size)
         pending = Cfg(cam, size, fps, prev)
         val w = resources.displayMetrics.widthPixels
         val ratio = max(prev.width, prev.height).toFloat() / min(prev.width, prev.height)
@@ -2773,6 +2849,21 @@ class MainActivity : Activity() {
         val s = session ?: return
         val d = device ?: return
         val cfg = activeCfg ?: return
+        if (s is CameraConstrainedHighSpeedCaptureSession) {
+            // слоумо: допускается только упрощённый запрос пачкой
+            try {
+                val b = d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                activeTargets.forEach { b.addTarget(it) }
+                b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, cfg.fps)
+                b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evIndex)
+                if (useZoomRatio && Build.VERSION.SDK_INT >= 30) b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
+                val af = cfg.cam.chars[CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES] ?: intArrayOf()
+                if (CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO in af)
+                    b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                s.setRepeatingBurst(s.createHighSpeedRequestList(b.build()), resultCb, bg)
+            } catch (_: Exception) {}
+            return
+        }
         try {
             val b = d.createCaptureRequest(activeTemplate)
             activeTargets.forEach { b.addTarget(it) }
@@ -2822,7 +2913,7 @@ class MainActivity : Activity() {
     }
 
     private fun bitrateFor(cfg: Cfg): Int {
-        val fps = if (tlIndex > 0) 30 else cfg.fps.upper
+        val fps = if (tlIndex > 0 || slowFps > 0) 30 else cfg.fps.upper
         val bpp = floatArrayOf(0.07f, 0.12f, 0.22f)[bitrateLevel] * (if (codecHevc) 1f else 1.6f)
         val v = (cfg.size.width.toLong() * cfg.size.height * fps * bpp).toLong()
         return v.coerceIn(4_000_000L, 160_000_000L).toInt()
@@ -2873,6 +2964,7 @@ class MainActivity : Activity() {
     private fun isFront(cam: Cam) = facing(cam.chars) == CameraCharacteristics.LENS_FACING_FRONT
 
     private fun createSession(cfg: Cfg, withPhoto: Boolean, withRaw: Boolean = true) {
+        if (slowFps > 0 && !photoMode) { createSlowSession(cfg); return }
         val d = device ?: return
         gl.camTexture.setDefaultBufferSize(cfg.preview.width, cfg.preview.height)
         val jr = if (withPhoto) photoReaderFor(cfg) else null
@@ -2981,7 +3073,7 @@ class MainActivity : Activity() {
             bg.post { burstNext() }
             return
         }
-        if (photoMode && profile != 0) {
+        if (photoMode && (profile != 0 || lutF != null)) {
             try {
                 val b = decodeUpright(bytes)
                 if (b != null) {
@@ -3086,7 +3178,7 @@ class MainActivity : Activity() {
 
     /** Цветовой профиль для фото — та же формула, что в видео. */
     private fun applyProfile(b: Bitmap, prof: Int) {
-        if (prof == 0) return
+        if (prof == 0 && lutF == null) return
         val w = b.width
         val row = IntArray(w)
         for (y in 0 until b.height) {
@@ -3108,6 +3200,34 @@ class MainActivity : Activity() {
             2 -> { sat(0.85f); con(1.12f); val d = (luma() - 0.5f) * 2f; r += 0.05f * d; bl -= 0.05f * d }
             3 -> { sat(1.3f); con(1.08f) }
             4 -> { val l = luma(); r = l; g = l; bl = l; con(1.15f) }
+        }
+        val lf = lutF
+        if (lf != null && lutNcpu >= 2) {
+            val n = lutNcpu
+            val m = (n - 1).toFloat()
+            val fr = r.coerceIn(0f, 1f) * m
+            val fg = g.coerceIn(0f, 1f) * m
+            val fb = bl.coerceIn(0f, 1f) * m
+            val r0 = min(fr.toInt(), n - 2)
+            val g0 = min(fg.toInt(), n - 2)
+            val b0 = min(fb.toInt(), n - 2)
+            val dr = fr - r0
+            val dg = fg - g0
+            val db = fb - b0
+            fun at(ri: Int, gi: Int, bi: Int, k: Int) = lf[((bi * n + gi) * n + ri) * 3 + k]
+            fun tri(k: Int): Float {
+                val c00 = at(r0, g0, b0, k) + (at(r0 + 1, g0, b0, k) - at(r0, g0, b0, k)) * dr
+                val c10 = at(r0, g0 + 1, b0, k) + (at(r0 + 1, g0 + 1, b0, k) - at(r0, g0 + 1, b0, k)) * dr
+                val c01 = at(r0, g0, b0 + 1, k) + (at(r0 + 1, g0, b0 + 1, k) - at(r0, g0, b0 + 1, k)) * dr
+                val c11 = at(r0, g0 + 1, b0 + 1, k) + (at(r0 + 1, g0 + 1, b0 + 1, k) - at(r0, g0 + 1, b0 + 1, k)) * dr
+                val c0 = c00 + (c10 - c00) * dg
+                val c1 = c01 + (c11 - c01) * dg
+                return c0 + (c1 - c0) * db
+            }
+            val nr = tri(0)
+            val ng = tri(1)
+            val nb = tri(2)
+            r = nr; g = ng; bl = nb
         }
         val ri = (r.coerceIn(0f, 1f) * 255).toInt()
         val gi = (g.coerceIn(0f, 1f) * 255).toInt()
@@ -3670,6 +3790,184 @@ class MainActivity : Activity() {
         return out
     }
 
+    // ----- слоумо -----
+
+    private fun pickSlow() {
+        if (recording) return
+        val map = curMap
+        if (map == null) { setStatus("Нет данных о камере", 2000); return }
+        val opts = mutableListOf<Pair<Size, Int>>()
+        map.highSpeedVideoSizes?.forEach { s ->
+            map.getHighSpeedVideoFpsRangesFor(s)
+                .filter { it.lower == it.upper && it.upper >= 90 }
+                .map { it.upper }.distinct()
+                .forEach { f -> opts += Pair(s, f) }
+        }
+        if (opts.isEmpty()) { setStatus("У этого объектива нет слоумо — попробуй 1×", 3000); return }
+        val sorted = opts.sortedWith(compareByDescending<Pair<Size, Int>> { it.second }.thenByDescending { it.first.width * it.first.height })
+        val labels = listOf((if (slowFps == 0) "✓ " else "") + "Выкл") + sorted.map {
+            (if (slowFps == it.second && slowSize == it.first) "✓ " else "") +
+                sizeName(it.first) + " · " + it.second + " к/с (замедление ×" + (it.second / 30) + ")"
+        }
+        AlertDialog.Builder(this, DIALOG).setTitle("Слоумо")
+            .setItems(labels.toTypedArray()) { _, i ->
+                if (i == 0) {
+                    slowFps = 0; slowSize = null; gl.previewEvery = 1
+                    setStatus("Слоумо выключено", 1200)
+                } else {
+                    val o = sorted[i - 1]
+                    slowSize = o.first; slowFps = o.second
+                    gl.previewEvery = max(1, o.second / 30)
+                    setStatus("Слоумо " + o.second + " к/с: видео без звука, играет в ×" + (o.second / 30) + " медленнее", 3000)
+                }
+                updateChips()
+                bg.post { closeCamera() }
+                restartPreview()
+            }.show()
+    }
+
+    private fun createSlowSession(cfg: Cfg) {
+        val d = device ?: return
+        gl.camTexture.setDefaultBufferSize(cfg.preview.width, cfg.preview.height)
+        val outs = listOf(OutputConfiguration(camSurface).also { o -> cfg.cam.physicalId?.let { o.setPhysicalCameraId(it) } })
+        val fail = {
+            slowFps = 0
+            slowSize = null
+            gl.previewEvery = 1
+            setStatus("Драйвер не запустил слоумо — вернул обычный режим", 4000)
+            ui { updateChips(); restartPreview() }
+        }
+        val sc = SessionConfiguration(SessionConfiguration.SESSION_HIGH_SPEED, outs, exec,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(s: CameraCaptureSession) {
+                    session = s
+                    photoReady = false
+                    rawReady = false
+                    activeTemplate = CameraDevice.TEMPLATE_RECORD
+                    activeTargets = listOf(camSurface)
+                    activeCfg = cfg
+                    gl.aspect1 = min(cfg.preview.width, cfg.preview.height).toFloat() / max(cfg.preview.width, cfg.preview.height)
+                    applyControls(false)
+                    ui { updateReadout() }
+                }
+                override fun onConfigureFailed(s: CameraCaptureSession) { fail() }
+            })
+        try { d.createCaptureSession(sc) } catch (e: Exception) { fail() }
+    }
+
+    // ----- LUT -----
+
+    private fun parseCube(text: String): Pair<Int, FloatArray>? {
+        var n = 0
+        val vals = ArrayList<Float>()
+        for (raw in text.lineSequence()) {
+            val l = raw.trim()
+            if (l.isEmpty() || l.startsWith("#")) continue
+            if (l.startsWith("LUT_3D_SIZE")) {
+                n = l.split(Regex("\\s+")).getOrNull(1)?.toIntOrNull() ?: 0
+                continue
+            }
+            if (l[0].isLetter()) continue
+            val p = l.split(Regex("\\s+"))
+            if (p.size >= 3) {
+                val a = p[0].toFloatOrNull() ?: continue
+                val b = p[1].toFloatOrNull() ?: continue
+                val cc = p[2].toFloatOrNull() ?: continue
+                vals += a; vals += b; vals += cc
+            }
+        }
+        if (n < 2 || n > 64 || vals.size < n * n * n * 3) return null
+        return Pair(n, vals.subList(0, n * n * n * 3).toFloatArray())
+    }
+
+    private fun applyLutData(n: Int, f: FloatArray) {
+        lutNcpu = n
+        lutF = f
+        val atlas = ByteArray(n * n * n * 3)
+        for (i in 0 until n * n * n) {
+            val r = i % n
+            val g = (i / n) % n
+            val b = i / (n * n)
+            val o = (g * n * n + b * n + r) * 3
+            for (k in 0..2) atlas[o + k] = (f[i * 3 + k].coerceIn(0f, 1f) * 255f + 0.5f).toInt().toByte()
+        }
+        gl.setLut(atlas, n)
+    }
+
+    private fun loadSavedLut() {
+        try {
+            if (!prefs.getBoolean("lutOn", false)) return
+            val file = File(filesDir, "lut.cube")
+            if (!file.exists()) return
+            val parsed = parseCube(file.readText()) ?: return
+            lutName = prefs.getString("lutName", "LUT") ?: "LUT"
+            applyLutData(parsed.first, parsed.second)
+            ui { updateChips() }
+        } catch (_: Exception) {}
+    }
+
+    private fun pickLut() {
+        val items = arrayOf("Загрузить файл .cube…", (if (lutF == null) "✓ " else "") + "Выключить LUT")
+        AlertDialog.Builder(this, DIALOG).setTitle("LUT (.cube)")
+            .setItems(items) { _, i ->
+                if (i == 0) {
+                    val it = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
+                    try {
+                        @Suppress("DEPRECATION")
+                        startActivityForResult(it, 11)
+                    } catch (e: Exception) {
+                        setStatus("Не открылся выбор файла", 2000)
+                    }
+                } else {
+                    lutF = null
+                    gl.setLut(null, 0)
+                    prefs.edit().putBoolean("lutOn", false).apply()
+                    updateChips()
+                    setStatus("LUT выключен", 1200)
+                }
+            }.show()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 11 || resultCode != RESULT_OK) return
+        val u = data?.data ?: return
+        bg.post {
+            try {
+                val text = contentResolver.openInputStream(u)?.bufferedReader()?.use { it.readText() } ?: return@post
+                val parsed = parseCube(text)
+                if (parsed == null) { setStatus("Это не 3D LUT .cube (поддерживается размер до 64)", 3500); return@post }
+                File(filesDir, "lut.cube").writeText(text)
+                lutName = try {
+                    contentResolver.query(u, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+                        ?.use { c -> if (c.moveToFirst()) c.getString(0) else null } ?: "LUT"
+                } catch (e: Exception) { "LUT" }
+                prefs.edit().putBoolean("lutOn", true).putString("lutName", lutName).apply()
+                applyLutData(parsed.first, parsed.second)
+                setStatus("LUT загружен: " + lutName, 2500)
+                ui { updateChips() }
+            } catch (e: Exception) {
+                setStatus("LUT не загрузился: " + e.message, 3000)
+            }
+        }
+    }
+
+    // ----- анаморф -----
+
+    private fun pickAnamorph() {
+        if (recording) { setStatus("Нельзя во время записи"); return }
+        val opts = floatArrayOf(1f, 1.33f, 1.55f, 2f)
+        val names = listOf("Выкл", "1.33×", "1.55×", "2×")
+        AlertDialog.Builder(this, DIALOG).setTitle("Анаморфная насадка")
+            .setItems(names.mapIndexed { i, n -> (if (abs(opts[i] - anamorph) < 0.01f) "✓ " else "") + n }.toTypedArray()) { _, i ->
+                anamorph = opts[i]
+                gl.desq = anamorph
+                prefs.edit().putFloat("anam", anamorph).apply()
+                setStatus(if (i == 0) "Анаморф выключен" else "Анаморф " + names[i] + ": кадр растягивается по горизонтали — только для видео с насадкой", 3500)
+            }.show()
+    }
+
     // ----- геометки -----
 
     private fun toggleGeo() {
@@ -3745,9 +4043,10 @@ class MainActivity : Activity() {
             pfd = fd
             // ориентация — по тому, как держат телефон в момент старта; поворот делает OpenGL
             val portrait = devOrient == 0 || devOrient == 180
-            val vw = if (portrait) cfg.size.height else cfg.size.width
+            val vw0 = if (portrait) cfg.size.height else cfg.size.width
+            val vw = if (anamorph > 1.01f && slowFps == 0) min(4096, ((vw0 * anamorph) / 16).toInt() * 16) else vw0
             val vh = if (portrait) cfg.size.width else cfg.size.height
-            val tl = timelapseRate()
+            val tl = if (slowFps > 0) slowFps.toFloat() else timelapseRate()
             val r = makeRecorder(cfg, vw, vh, fd.fileDescriptor, tl <= 0f, tl)
             r.prepare()
             recorder = r
