@@ -2920,14 +2920,30 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Координата в формате EXIF: градусы, минуты, секунды. */
+    private fun dms(v: Double): String {
+        val a = abs(v)
+        val d = a.toInt()
+        val mf = (a - d) * 60
+        val m = mf.toInt()
+        val s = ((mf - m) * 60 * 1000).toLong()
+        return "" + d + "/1," + m + "/1," + s + "/1000"
+    }
+
     private fun geotag(uri: Uri) {
         val loc = lastLoc ?: return
         if (!geoOn) return
         try {
             contentResolver.openFileDescriptor(uri, "rw")?.use { fd ->
                 val ex = ExifInterface(fd.fileDescriptor)
-                ex.setLatLong(loc.latitude, loc.longitude)
-                if (loc.hasAltitude()) ex.setAltitude(loc.altitude)
+                ex.setAttribute(ExifInterface.TAG_GPS_LATITUDE, dms(loc.latitude))
+                ex.setAttribute(ExifInterface.TAG_GPS_LATITUDE_REF, if (loc.latitude >= 0) "N" else "S")
+                ex.setAttribute(ExifInterface.TAG_GPS_LONGITUDE, dms(loc.longitude))
+                ex.setAttribute(ExifInterface.TAG_GPS_LONGITUDE_REF, if (loc.longitude >= 0) "E" else "W")
+                if (loc.hasAltitude()) {
+                    ex.setAttribute(ExifInterface.TAG_GPS_ALTITUDE, "" + (abs(loc.altitude) * 100).toLong() + "/100")
+                    ex.setAttribute(ExifInterface.TAG_GPS_ALTITUDE_REF, if (loc.altitude >= 0) "0" else "1")
+                }
                 ex.saveAttributes()
             }
         } catch (_: Exception) {}
