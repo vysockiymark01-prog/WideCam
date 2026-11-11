@@ -442,6 +442,7 @@ class GlPipe {
     private var uLut = 0
     private var uLutN = 0
     private var uLutOn = 0
+    private var sTexLoc = 0
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(16 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
         put(floatArrayOf(-1f, -1f, 0f, 0f, 1f, -1f, 1f, 0f, -1f, 1f, 0f, 1f, 1f, 1f, 1f, 1f))
         position(0)
@@ -508,6 +509,7 @@ class GlPipe {
         uLut = GLES20.glGetUniformLocation(prog, "uLut")
         uLutN = GLES20.glGetUniformLocation(prog, "uLutN")
         uLutOn = GLES20.glGetUniformLocation(prog, "uLutOn")
+        sTexLoc = GLES20.glGetUniformLocation(prog, "sTex")
         android.opengl.Matrix.setIdentityM(ident, 0)
     }
 
@@ -521,10 +523,12 @@ class GlPipe {
     private fun quadDraw(m: FloatArray, peak: Boolean = false, t: Int = tex, stm: FloatArray = st) {
         GLES20.glUseProgram(prog)
         val useLut = lutOn && lutTex != 0
+        // разные типы сэмплеров не могут смотреть в один слот: камера — слот 0, LUT — всегда слот 1
+        GLES20.glUniform1i(sTexLoc, 0)
+        GLES20.glUniform1i(uLut, 1)
         if (useLut) {
             GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTex)
-            GLES20.glUniform1i(uLut, 1)
             GLES20.glUniform1f(uLutN, lutN)
         }
         GLES20.glUniform1i(uLutOn, if (useLut) 1 else 0)
