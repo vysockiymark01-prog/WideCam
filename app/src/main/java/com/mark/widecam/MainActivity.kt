@@ -422,6 +422,15 @@ class GlPipe {
     private val mvp = FloatArray(16)
     private val ident = FloatArray(16)
     lateinit var camTexture: SurfaceTexture
+    lateinit var camTexture2: SurfaceTexture
+    private var tex2 = 0
+    private val st2 = FloatArray(16)
+    @Volatile private var cam2Fresh = false
+    @Volatile var has2 = false
+    @Volatile var dual = 0
+    @Volatile var aspect1 = 0.5625f
+    @Volatile var aspect2 = 0.5625f
+    @Volatile var mirror2 = false
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(16 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
         put(floatArrayOf(-1f, -1f, 0f, 0f, 1f, -1f, 1f, 0f, -1f, 1f, 0f, 1f, 1f, 1f, 1f, 1f))
         position(0)
@@ -461,6 +470,16 @@ class GlPipe {
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         camTexture = SurfaceTexture(tex)
         camTexture.setOnFrameAvailableListener({ draw() }, handler)
+        val t2 = IntArray(1)
+        GLES20.glGenTextures(1, t2, 0)
+        tex2 = t2[0]
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex2)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        camTexture2 = SurfaceTexture(tex2)
+        camTexture2.setOnFrameAvailableListener({ cam2Fresh = true }, handler)
 
         val vs = "attribute vec4 aPos;\nattribute vec4 aTex;\nuniform mat4 uST;\nuniform mat4 uMVP;\nvarying vec2 vTex;\nvoid main() {\n  gl_Position = uMVP * aPos;\n  vTex = (uST * aTex).xy;\n}\n"
         val fs = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\nvarying vec2 vTex;\nuniform samplerExternalOES sTex;\nuniform int uProf;\nuniform int uPeak;\nuniform vec2 uTexel;\nvec3 sat(vec3 c, float s) { float l = dot(c, vec3(0.299, 0.587, 0.114)); return mix(vec3(l), c, s); }\nvec3 con(vec3 c, float k) { return (c - 0.5) * k + 0.5; }\nvoid main() {\n  vec3 c = texture2D(sTex, vTex).rgb;\n  if (uProf == 1) { c = con(c, 0.78) + 0.03; c = sat(c, 0.8); }\n  else if (uProf == 2) { c = sat(c, 0.85); c = con(c, 1.12); float l = dot(c, vec3(0.299, 0.587, 0.114)); c += vec3(0.05, 0.0, -0.05) * (l - 0.5) * 2.0; }\n  else if (uProf == 3) { c = sat(c, 1.3); c = con(c, 1.08); }\n  else if (uProf == 4) { float l = dot(c, vec3(0.299, 0.587, 0.114)); c = con(vec3(l), 1.15); }\n  if (uPeak == 1) {\n    float l0 = dot(texture2D(sTex, vTex).rgb, vec3(0.299, 0.587, 0.114));\n    float lx = dot(texture2D(sTex, vTex + vec2(uTexel.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n    float ly = dot(texture2D(sTex, vTex + vec2(0.0, uTexel.y)).rgb, vec3(0.299, 0.587, 0.114));\n    if (abs(lx - l0) + abs(ly - l0) > 0.12) c = vec3(1.0, 0.15, 0.15);\n  }\n  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);\n}\n"
@@ -485,11 +504,11 @@ class GlPipe {
         return s
     }
 
-    private fun quadDraw(m: FloatArray, peak: Boolean = false) {
+    private fun quadDraw(m: FloatArray, peak: Boolean = false, t: Int = tex, stm: FloatArray = st) {
         GLES20.glUseProgram(prog)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
-        GLES20.glUniformMatrix4fv(uST, 1, false, st, 0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, t)
+        GLES20.glUniformMatrix4fv(uST, 1, false, stm, 0)
         GLES20.glUniformMatrix4fv(uMVP, 1, false, m, 0)
         GLES20.glUniform1i(uProf, profile)
         GLES20.glUniform1i(uPeak, if (peak) 1 else 0)
@@ -508,25 +527,81 @@ class GlPipe {
             EGL14.eglMakeCurrent(dpy, pbuf, pbuf, ctx)
             camTexture.updateTexImage()
             camTexture.getTransformMatrix(st)
+            if (cam2Fresh) {
+                cam2Fresh = false
+                camTexture2.updateTexImage()
+                camTexture2.getTransformMatrix(st2)
+            }
             computeCorr()
             if (prevSurf != EGL14.EGL_NO_SURFACE) {
                 EGL14.eglMakeCurrent(dpy, prevSurf, prevSurf, ctx)
-                GLES20.glViewport(0, 0, pw, ph)
-                quadDraw(corr, peaking)
+                compose(pw, ph, 0f, false, false, peaking)
                 EGL14.eglSwapBuffers(dpy, prevSurf)
             }
             if (encSurf != EGL14.EGL_NO_SURFACE) {
                 EGL14.eglMakeCurrent(dpy, encSurf, encSurf, ctx)
-                GLES20.glViewport(0, 0, ew, eh)
-                android.opengl.Matrix.setIdentityM(mvp, 0)
-                if (encMirror) android.opengl.Matrix.scaleM(mvp, 0, -1f, 1f, 1f)
-                android.opengl.Matrix.rotateM(mvp, 0, encRot, 0f, 0f, 1f)
-                android.opengl.Matrix.multiplyMM(tmp, 0, mvp, 0, corr, 0)
-                quadDraw(tmp)
+                compose(ew, eh, encRot, encMirror, mirror2, false)
                 EGLExt.eglPresentationTimeANDROID(dpy, encSurf, System.nanoTime())
                 EGL14.eglSwapBuffers(dpy, encSurf)
             }
         } catch (_: Exception) {}
+    }
+
+    /** Кадр целиком: основная камера + (если включено) вторая — окном или пополам. */
+    private fun compose(fw: Int, fh: Int, rot: Float, mirror: Boolean, mirrorB: Boolean, peak: Boolean) {
+        GLES20.glViewport(0, 0, fw, fh)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        val second = dual != 0 && has2
+        if (second && dual == 2) {
+            if (fw >= fh) {
+                val hw = fw / 2
+                drawFill(tex, st, 0, 0, hw, fh, aspect1, rot, mirror, true, peak)
+                drawFill(tex2, st2, hw, 0, fw - hw, fh, aspect2, rot, mirrorB, false, false)
+            } else {
+                val hh = fh / 2
+                drawFill(tex, st, 0, hh, fw, fh - hh, aspect1, rot, mirror, true, peak)
+                drawFill(tex2, st2, 0, 0, fw, hh, aspect2, rot, mirrorB, false, false)
+            }
+            return
+        }
+        drawFill(tex, st, 0, 0, fw, fh, aspect1, rot, mirror, true, peak)
+        if (second && dual == 1) {
+            val ca = if (abs(rot % 180f) > 1f) 1f / aspect2 else aspect2
+            val short = 0.32f * min(fw, fh)
+            val w: Int
+            val h: Int
+            if (ca < 1f) { w = short.toInt(); h = (short / ca).toInt() } else { h = short.toInt(); w = (short * ca).toInt() }
+            val m = (0.035f * min(fw, fh)).toInt()
+            val x = fw - w - m
+            val y = fh - h - m
+            val bw = max(2, min(fw, fh) / 200)
+            GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+            GLES20.glScissor(x - bw, y - bw, w + 2 * bw, h + 2 * bw)
+            GLES20.glClearColor(1f, 1f, 1f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+            drawFill(tex2, st2, x, y, w, h, aspect2, rot, mirrorB, false, false)
+        }
+    }
+
+    /** Рисует картинку камеры в прямоугольник с обрезкой по краям (без растягивания). */
+    private fun drawFill(t: Int, stm: FloatArray, vx: Int, vy: Int, vw: Int, vh: Int, a: Float, rot: Float, mirror: Boolean, useCorr: Boolean, peak: Boolean) {
+        if (vw <= 0 || vh <= 0) return
+        GLES20.glViewport(vx, vy, vw, vh)
+        val ca = if (abs(rot % 180f) > 1f) 1f / a else a
+        val va = vw.toFloat() / vh
+        var sx = 1f
+        var sy = 1f
+        if (ca > va) sx = ca / va else sy = va / ca
+        android.opengl.Matrix.setIdentityM(mvp, 0)
+        android.opengl.Matrix.scaleM(mvp, 0, sx, sy, 1f)
+        if (mirror) android.opengl.Matrix.scaleM(mvp, 0, -1f, 1f, 1f)
+        android.opengl.Matrix.rotateM(mvp, 0, rot, 0f, 0f, 1f)
+        if (useCorr) {
+            android.opengl.Matrix.multiplyMM(tmp, 0, mvp, 0, corr, 0)
+            quadDraw(tmp, peak, t, stm)
+        } else quadDraw(mvp, peak, t, stm)
     }
 
     /** Блокировка горизонта: поворачиваем кадр против наклона и чуть приближаем, чтобы не было пустых углов. */
@@ -579,6 +654,7 @@ class GlPipe {
             EGL14.eglMakeCurrent(dpy, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
             EGL14.eglDestroySurface(dpy, pbuf)
             camTexture.release()
+            camTexture2.release()
             EGL14.eglDestroyContext(dpy, ctx)
             EGL14.eglTerminate(dpy)
         }
@@ -673,6 +749,8 @@ class MainActivity : Activity() {
     private lateinit var lockOverlay: TextView
     private lateinit var formatChip: TextView
     private lateinit var shotChip: TextView
+    private lateinit var dualChip: TextView
+    private lateinit var cam2Surface: Surface
     private lateinit var settingsBtn: TextView
     private lateinit var wheel: ZoomWheel
     private lateinit var lensBar: LinearLayout
@@ -748,6 +826,10 @@ class MainActivity : Activity() {
     )
     private val shotShort = listOf("обычное", "брекетинг", "HDR", "ночь", "длинная ×16", "длинная ×32", "фокус-брекетинг")
     private var shotMode = 0
+    private var dualMode = 0
+    private var dualFailed = false
+    @Volatile private var dev2: CameraDevice? = null
+    @Volatile private var ses2: CameraCaptureSession? = null
     @Volatile private var job: ShotJob? = null
     @Volatile private var bursting = false
     @Volatile private var burstCount = 0
@@ -934,6 +1016,7 @@ class MainActivity : Activity() {
         gl = GlPipe()
         gl.start()
         camSurface = Surface(gl.camTexture)
+        cam2Surface = Surface(gl.camTexture2)
         buildUi()
         grid.mode = prefs.getInt("grid", 0)
         guide.mode = prefs.getInt("guide", 0)
@@ -952,6 +1035,8 @@ class MainActivity : Activity() {
         rawOn = prefs.getBoolean("raw", false)
         shotMode = prefs.getInt("shotMode", 0).coerceIn(0, 6)
         geoOn = prefs.getBoolean("geo", false)
+        dualMode = prefs.getInt("dual", 0).coerceIn(0, 2)
+        gl.dual = dualMode
         applyModeUi()
         orient = object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
@@ -1143,9 +1228,10 @@ class MainActivity : Activity() {
         focusChip = chip().apply { setOnClickListener { toggleFocusPanel() } }
         formatChip = chip().apply { visibility = View.GONE; setOnClickListener { toggleRaw() } }
         shotChip = chip().apply { visibility = View.GONE; setOnClickListener { pickShotMode() } }
+        dualChip = chip().apply { setOnClickListener { pickDual() } }
         starChip = chip().apply { text = "★ Метка"; setTextColor(YELLOW); visibility = View.GONE; setOnClickListener { addMarker() } }
         settingsBtn = chip().apply { text = "⚙"; textSize = 17f; setOnClickListener { showSettings() } }
-        listOf(starChip, shotChip, resChip, formatChip, fpsChip, focusChip, isoChip, shutterChip, wbChip, evChip, profileChip, stabChip, horizonChip, timerChip, torchChip, settingsBtn)
+        listOf(starChip, shotChip, resChip, formatChip, fpsChip, focusChip, isoChip, shutterChip, wbChip, evChip, profileChip, stabChip, horizonChip, dualChip, timerChip, torchChip, settingsBtn)
             .forEachIndexed { i, v -> row.addView(v, lp(WRAP, WRAP).apply { if (i > 0) leftMargin = dp(8) }) }
         val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
         scroll.addView(row, FrameLayout.LayoutParams(WRAP, MATCH))
@@ -1431,6 +1517,8 @@ class MainActivity : Activity() {
         formatChip.text = if (rawOn) "RAW+JPEG" else "JPEG"
         formatChip.setTextColor(if (rawOn) YELLOW else Color.WHITE)
         shotChip.text = "Режим: " + shotShort[shotMode]
+        dualChip.text = when (dualMode) { 1 -> "2 камеры: окно"; 2 -> "2 камеры: пополам"; else -> "2 камеры" }
+        dualChip.setTextColor(if (dualMode != 0) YELLOW else Color.WHITE)
         shotChip.setTextColor(if (shotMode != 0) YELLOW else Color.WHITE)
         profileChip.text = "Цвет: " + profileShort[profile]
         profileChip.setTextColor(if (profile != 0) YELLOW else Color.WHITE)
@@ -1929,7 +2017,7 @@ class MainActivity : Activity() {
 
     private fun applyModeUi() {
         val v = if (photoMode) View.GONE else View.VISIBLE
-        listOf<View>(fpsChip, profileChip, horizonChip).forEach { it.visibility = v }
+        listOf<View>(fpsChip, profileChip, horizonChip, dualChip).forEach { it.visibility = v }
         formatChip.visibility = if (photoMode) View.VISIBLE else View.GONE
         shotChip.visibility = if (photoMode) View.VISIBLE else View.GONE
         photoBtn.text = if (photoMode) "🎥" else "📷"
@@ -2537,6 +2625,7 @@ class MainActivity : Activity() {
     // ---------- камера ----------
 
     private fun closeCamera() {
+        closeSecond()
         try { session?.close() } catch (_: Exception) {}
         session = null
         activeCfg = null
@@ -2788,6 +2877,8 @@ class MainActivity : Activity() {
                     gl.texelX = 1f / cfg.preview.width; gl.texelY = 1f / cfg.preview.height
                     applyControls(afPoint != null && canFocus(cfg.cam.chars))
                     ui { updateReadout() }
+                    gl.aspect1 = min(cfg.preview.width, cfg.preview.height).toFloat() / max(cfg.preview.width, cfg.preview.height)
+                    if (dualMode != 0 && !photoMode && dev2 == null && !dualFailed) openSecond(cfg)
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
@@ -3308,6 +3399,117 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             bursting = false
         }
+    }
+
+    // ----- две камеры -----
+
+    private fun pickDual() {
+        if (recording) { setStatus("Режим двух камер меняется до записи", 2000); return }
+        val names = arrayOf("Выкл", "Окно — вторая камера в углу", "Пополам")
+        AlertDialog.Builder(this, DIALOG).setTitle("Две камеры")
+            .setItems(names.mapIndexed { i, n -> (if (i == dualMode) "✓ " else "") + n }.toTypedArray()) { _, i ->
+                dualMode = i
+                gl.dual = i
+                dualFailed = false
+                prefs.edit().putInt("dual", i).apply()
+                updateChips()
+                if (i == 0) {
+                    bg.post { closeSecond() }
+                    setStatus("Одна камера", 1200)
+                } else {
+                    setStatus("Включаю вторую камеру…", 2000)
+                    restartPreview()
+                }
+            }.show()
+    }
+
+    /** Вторая камера: для задней — фронталка, для фронталки — основная задняя. */
+    private fun secondFor(cam: Cam): Cam? =
+        if (isFront(cam)) lenses.firstOrNull { it.title == "1" && it.zoom == 1f }?.cam
+            ?: cams.firstOrNull { facing(it.chars) == CameraCharacteristics.LENS_FACING_BACK && !it.hidden && it.physicalId == null }
+        else lenses.firstOrNull { it.title == "Фронт" }?.cam
+
+    private fun secondSize(c: Cam): Size {
+        val all = streamMap(c)?.getOutputSizes(SurfaceTexture::class.java)?.toList() ?: emptyList()
+        return all.filter { abs(it.width.toFloat() / it.height - 16f / 9f) < 0.02f && it.width * it.height <= 1280 * 720 }
+            .maxByOrNull { it.width * it.height }
+            ?: all.filter { it.width * it.height <= 1280 * 720 }.maxByOrNull { it.width * it.height }
+            ?: Size(1280, 720)
+    }
+
+    private fun secondFps(c: Cam): Range<Int> {
+        val r = c.chars[CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES]?.toList() ?: listOf(Range(30, 30))
+        return r.filter { it.upper == 30 }.maxByOrNull { it.lower } ?: r.maxByOrNull { it.upper } ?: Range(30, 30)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openSecond(cfg: Cfg) {
+        val c2 = secondFor(cfg.cam)
+        if (c2 == null || c2.openId == cfg.cam.openId) { setStatus("Не нашёл вторую камеру для этой пары", 2500); return }
+        if (Build.VERSION.SDK_INT >= 30) {
+            val sets = try { mgr.concurrentCameraIds } catch (e: Exception) { emptySet<Set<String>>() }
+            if (sets.none { it.contains(cfg.cam.openId) && it.contains(c2.openId) })
+                setStatus("Драйвер не обещает работу этих двух камер сразу — пробую", 2500)
+        }
+        try {
+            mgr.openCamera(c2.openId, exec, object : CameraDevice.StateCallback() {
+                override fun onOpened(d: CameraDevice) {
+                    if (dualMode == 0 || photoMode) { d.close(); return }
+                    dev2 = d
+                    val sz = secondSize(c2)
+                    gl.camTexture2.setDefaultBufferSize(sz.width, sz.height)
+                    gl.aspect2 = min(sz.width, sz.height).toFloat() / max(sz.width, sz.height)
+                    gl.mirror2 = isFront(c2) && mirrorFront
+                    val outs = listOf(OutputConfiguration(cam2Surface).also { o -> c2.physicalId?.let { o.setPhysicalCameraId(it) } })
+                    val sc = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outs, exec,
+                        object : CameraCaptureSession.StateCallback() {
+                            override fun onConfigured(s: CameraCaptureSession) {
+                                ses2 = s
+                                try {
+                                    val b = d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                                    b.addTarget(cam2Surface)
+                                    b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, secondFps(c2))
+                                    val af = c2.chars[CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES] ?: intArrayOf()
+                                    if (CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO in af)
+                                        b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                                    s.setRepeatingRequest(b.build(), null, bg)
+                                    gl.has2 = true
+                                    setStatus("Две камеры включены", 1500)
+                                } catch (e: Exception) {
+                                    dualFail("второй поток не запустился")
+                                }
+                            }
+                            override fun onConfigureFailed(s: CameraCaptureSession) { dualFail("драйвер не дал второй поток") }
+                        })
+                    try { d.createCaptureSession(sc) } catch (e: Exception) { dualFail(e.message ?: "ошибка сессии") }
+                }
+                override fun onDisconnected(d: CameraDevice) {
+                    d.close()
+                    if (dev2 == d) { dev2 = null; gl.has2 = false }
+                }
+                override fun onError(d: CameraDevice, error: Int) {
+                    d.close()
+                    if (dev2 == d) dev2 = null
+                    dualFail("код $error")
+                }
+            })
+        } catch (e: Exception) {
+            dualFail(e.message ?: "камера занята")
+        }
+    }
+
+    private fun dualFail(why: String) {
+        closeSecond()
+        dualFailed = true
+        setStatus("Две камеры сразу не получилось (" + why + ") — телефон, похоже, не держит эту пару", 5000)
+    }
+
+    private fun closeSecond() {
+        gl.has2 = false
+        try { ses2?.close() } catch (_: Exception) {}
+        ses2 = null
+        try { dev2?.close() } catch (_: Exception) {}
+        dev2 = null
     }
 
     // ----- геометки -----
