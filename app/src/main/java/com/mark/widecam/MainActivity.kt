@@ -1688,9 +1688,51 @@ class MainActivity : Activity() {
         readout.text = parts.joinToString("  ·  ")
     }
 
+    /** Кнопки фокусных для фронталки: шире (если камера даёт зум меньше 1), 1, 1.5, 2, 3. */
+    private fun frontPresets(c: Cam): List<Lens> {
+        val zr = if (Build.VERSION.SDK_INT >= 30) c.chars[CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE] else null
+        val lo = zr?.lower ?: 1f
+        val hi = min(zr?.upper ?: (c.chars[CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM] ?: 1f), 10f)
+        val out = mutableListOf<Lens>()
+        if (lo < 0.95f) out += Lens(String.format(Locale.US, "%.1f", lo), c, lo)
+        out += Lens("1", c, 1f)
+        for (p in listOf(1.5f, 2f, 3f)) if (p <= hi + 0.01f) out += Lens(if (p == 1.5f) "1.5" else p.roundToInt().toString(), c, p)
+        return out
+    }
+
+    /** Возврат с фронталки туда, где был до неё: тот же объектив и тот же зум. */
+    private fun backToRear() {
+        val key = prefs.getString("rearCam", null)
+        val c = cams.firstOrNull { it.key == key && !isFront(it) }
+            ?: lenses.firstOrNull { it.title == "1" && it.zoom == 1f }?.cam
+            ?: lenses.firstOrNull { !isFront(it.cam) }?.cam ?: return
+        selectCam(c, if (c.key == key) prefs.getFloat("rearZoom", 1f) else 1f)
+    }
+
+    private fun rearLabel(): String {
+        val key = prefs.getString("rearCam", null)
+        val z = prefs.getFloat("rearZoom", 1f)
+        return lenses.firstOrNull { it.cam.key == key && abs(it.zoom - z) < 0.05f }?.let { "↩ " + it.title + "×" } ?: "↩ Задняя"
+    }
+
     private fun renderLenses() {
         lensBar.removeAllViews()
-        for (l in lenses) {
+        val cc = curCam
+        val onFront = cc != null && isFront(cc)
+        if (onFront) {
+            val back = TextView(this).apply {
+                text = rearLabel()
+                setTextColor(Color.WHITE)
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                background = pill(0x55FFFFFF)
+                rotation = uiDeg(devOrient)
+                setOnClickListener { backToRear() }
+            }
+            lensBar.addView(back, lp(dp(72), dp(44)).apply { leftMargin = dp(2); rightMargin = dp(8) })
+        }
+        for (l in if (onFront) frontPresets(cc!!) else lenses) {
             val sel = l.cam.key == curCam?.key && abs(zoom - l.zoom) < 0.05f
             val front = l.title == "Фронт"
             val tv = TextView(this).apply {
@@ -2560,6 +2602,7 @@ class MainActivity : Activity() {
     private fun selectCam(cam: Cam, startZoom: Float = 1f) {
         if (recording && slowFps > 0) { setStatus("Во время слоумо объектив не переключается", 2000); return }
         if (!recording && slowFps > 0) { slowFps = 0; slowSize = null; gl.previewEvery = 1 }
+        curCam?.let { if (!isFront(it) && isFront(cam)) prefs.edit().putString("rearCam", it.key).putFloat("rearZoom", zoom).apply() }
         curCam = cam
         gl.frontCam = false
         prefs.edit().putString("cam", cam.key).apply()
