@@ -20,6 +20,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Shader
@@ -443,6 +444,15 @@ class GlPipe {
     private var uLutN = 0
     private var uLutOn = 0
     private var sTexLoc = 0
+    private var uMaskL = 0
+    private var uRectL = 0
+    private var uSolidL = 0
+    @Volatile var pipShape = 0
+    @Volatile var pipCorner = 0
+    private var curMask = 0
+    private var curSolid = 0
+    private val curRect = FloatArray(4)
+    private fun setRect(x: Int, y: Int, w: Int, h: Int) { curRect[0] = x.toFloat(); curRect[1] = y.toFloat(); curRect[2] = w.toFloat(); curRect[3] = h.toFloat() }
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(16 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
         put(floatArrayOf(-1f, -1f, 0f, 0f, 1f, -1f, 1f, 0f, -1f, 1f, 0f, 1f, 1f, 1f, 1f, 1f))
         position(0)
@@ -494,7 +504,7 @@ class GlPipe {
         camTexture2.setOnFrameAvailableListener({ cam2Fresh = true }, handler)
 
         val vs = "attribute vec4 aPos;\nattribute vec4 aTex;\nuniform mat4 uST;\nuniform mat4 uMVP;\nvarying vec2 vTex;\nvoid main() {\n  gl_Position = uMVP * aPos;\n  vTex = (uST * aTex).xy;\n}\n"
-        val fs = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\nvarying vec2 vTex;\nuniform samplerExternalOES sTex;\nuniform int uProf;\nuniform int uPeak;\nuniform vec2 uTexel;\nuniform sampler2D uLut;\nuniform float uLutN;\nuniform int uLutOn;\nvec3 sat(vec3 c, float s) { float l = dot(c, vec3(0.299, 0.587, 0.114)); return mix(vec3(l), c, s); }\nvec3 con(vec3 c, float k) { return (c - 0.5) * k + 0.5; }\nvec3 lut(vec3 c) { float n = uLutN; float b = c.b * (n - 1.0); float b0 = floor(b); float b1 = min(b0 + 1.0, n - 1.0); float f = b - b0; float x = c.r * (n - 1.0) + 0.5; float y = (c.g * (n - 1.0) + 0.5) / n; vec3 a0 = texture2D(uLut, vec2((b0 * n + x) / (n * n), y)).rgb; vec3 a1 = texture2D(uLut, vec2((b1 * n + x) / (n * n), y)).rgb; return mix(a0, a1, f); }\nvoid main() {\n  vec3 c = texture2D(sTex, vTex).rgb;\n  if (uProf == 1) { c = con(c, 0.78) + 0.03; c = sat(c, 0.8); }\n  else if (uProf == 2) { c = sat(c, 0.85); c = con(c, 1.12); float l = dot(c, vec3(0.299, 0.587, 0.114)); c += vec3(0.05, 0.0, -0.05) * (l - 0.5) * 2.0; }\n  else if (uProf == 3) { c = sat(c, 1.3); c = con(c, 1.08); }\n  else if (uProf == 4) { float l = dot(c, vec3(0.299, 0.587, 0.114)); c = con(vec3(l), 1.15); }\n  if (uLutOn == 1) c = lut(clamp(c, 0.0, 1.0));\n  if (uPeak == 1) {\n    float l0 = dot(texture2D(sTex, vTex).rgb, vec3(0.299, 0.587, 0.114));\n    float lx = dot(texture2D(sTex, vTex + vec2(uTexel.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n    float ly = dot(texture2D(sTex, vTex + vec2(0.0, uTexel.y)).rgb, vec3(0.299, 0.587, 0.114));\n    if (abs(lx - l0) + abs(ly - l0) > 0.12) c = vec3(1.0, 0.15, 0.15);\n  }\n  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);\n}\n"
+        val fs = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\nvarying vec2 vTex;\nuniform samplerExternalOES sTex;\nuniform int uProf;\nuniform int uPeak;\nuniform vec2 uTexel;\nuniform sampler2D uLut;\nuniform float uLutN;\nuniform int uLutOn;\nuniform int uMask;\nuniform vec4 uRect;\nuniform int uSolid;\nfloat shapeIn() { vec2 hs = uRect.zw * 0.5; vec2 pp = gl_FragCoord.xy - uRect.xy - hs; if (uMask == 1) { float r = 0.2 * min(hs.x, hs.y); vec2 q = abs(pp) - hs + r; return step(length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r, 0.0); } if (uMask == 2) return step(length(pp), min(hs.x, hs.y)); if (uMask == 3) return step(abs(pp.x) / hs.x + abs(pp.y) / hs.y, 1.0); if (uMask == 4) { float x = pp.x / hs.x * 1.2; float y = pp.y / hs.y * 1.2 + 0.2; float a = x * x + y * y - 1.0; return step(a * a * a - x * x * y * y * y, 0.0); } return 1.0; }\nvec3 sat(vec3 c, float s) { float l = dot(c, vec3(0.299, 0.587, 0.114)); return mix(vec3(l), c, s); }\nvec3 con(vec3 c, float k) { return (c - 0.5) * k + 0.5; }\nvec3 lut(vec3 c) { float n = uLutN; float b = c.b * (n - 1.0); float b0 = floor(b); float b1 = min(b0 + 1.0, n - 1.0); float f = b - b0; float x = c.r * (n - 1.0) + 0.5; float y = (c.g * (n - 1.0) + 0.5) / n; vec3 a0 = texture2D(uLut, vec2((b0 * n + x) / (n * n), y)).rgb; vec3 a1 = texture2D(uLut, vec2((b1 * n + x) / (n * n), y)).rgb; return mix(a0, a1, f); }\nvoid main() {\n  if (uMask > 0 && shapeIn() < 0.5) discard;\n  if (uSolid == 1) { gl_FragColor = vec4(1.0); return; }\n  vec3 c = texture2D(sTex, vTex).rgb;\n  if (uProf == 1) { c = con(c, 0.78) + 0.03; c = sat(c, 0.8); }\n  else if (uProf == 2) { c = sat(c, 0.85); c = con(c, 1.12); float l = dot(c, vec3(0.299, 0.587, 0.114)); c += vec3(0.05, 0.0, -0.05) * (l - 0.5) * 2.0; }\n  else if (uProf == 3) { c = sat(c, 1.3); c = con(c, 1.08); }\n  else if (uProf == 4) { float l = dot(c, vec3(0.299, 0.587, 0.114)); c = con(vec3(l), 1.15); }\n  if (uLutOn == 1) c = lut(clamp(c, 0.0, 1.0));\n  if (uPeak == 1) {\n    float l0 = dot(texture2D(sTex, vTex).rgb, vec3(0.299, 0.587, 0.114));\n    float lx = dot(texture2D(sTex, vTex + vec2(uTexel.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n    float ly = dot(texture2D(sTex, vTex + vec2(0.0, uTexel.y)).rgb, vec3(0.299, 0.587, 0.114));\n    if (abs(lx - l0) + abs(ly - l0) > 0.12) c = vec3(1.0, 0.15, 0.15);\n  }\n  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);\n}\n"
         prog = GLES20.glCreateProgram()
         GLES20.glAttachShader(prog, shader(GLES20.GL_VERTEX_SHADER, vs))
         GLES20.glAttachShader(prog, shader(GLES20.GL_FRAGMENT_SHADER, fs))
@@ -510,6 +520,9 @@ class GlPipe {
         uLutN = GLES20.glGetUniformLocation(prog, "uLutN")
         uLutOn = GLES20.glGetUniformLocation(prog, "uLutOn")
         sTexLoc = GLES20.glGetUniformLocation(prog, "sTex")
+        uMaskL = GLES20.glGetUniformLocation(prog, "uMask")
+        uRectL = GLES20.glGetUniformLocation(prog, "uRect")
+        uSolidL = GLES20.glGetUniformLocation(prog, "uSolid")
         android.opengl.Matrix.setIdentityM(ident, 0)
     }
 
@@ -539,6 +552,9 @@ class GlPipe {
         GLES20.glUniform1i(uProf, profile)
         GLES20.glUniform1i(uPeak, if (peak) 1 else 0)
         GLES20.glUniform2f(uTexel, texelX, texelY)
+        GLES20.glUniform1i(uMaskL, curMask)
+        GLES20.glUniform4f(uRectL, curRect[0], curRect[1], curRect[2], curRect[3])
+        GLES20.glUniform1i(uSolidL, curSolid)
         quad.position(0)
         GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, quad)
         GLES20.glEnableVertexAttribArray(aPos)
@@ -595,20 +611,25 @@ class GlPipe {
         drawFill(tex, st, 0, 0, fw, fh, aspect1, rot, mirror, true, peak, dq)
         if (second && dual == 1) {
             val ca = if (abs(rot % 180f) > 1f) 1f / aspect2 else aspect2
+            val shp = pipShape
             val short = 0.32f * min(fw, fh)
-            val w: Int
-            val h: Int
+            var w: Int
+            var h: Int
             if (ca < 1f) { w = short.toInt(); h = (short / ca).toInt() } else { h = short.toInt(); w = (short * ca).toInt() }
+            if (shp >= 2) { w = (short * 1.15f).toInt(); h = w }
             val m = (0.035f * min(fw, fh)).toInt()
-            val x = fw - w - m
-            val y = fh - h - m
+            val cr = pipCorner
+            val x = if (cr % 2 == 0) fw - w - m else m
+            val y = if (cr < 2) fh - h - m else m
             val bw = max(2, min(fw, fh) / 200)
-            GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
-            GLES20.glScissor(x - bw, y - bw, w + 2 * bw, h + 2 * bw)
-            GLES20.glClearColor(1f, 1f, 1f, 1f)
-            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+            curMask = when (shp) { 1 -> 1; 2 -> 2; 4 -> 3; 5 -> 4; else -> 0 }
+            curSolid = 1
+            setRect(x - bw, y - bw, w + 2 * bw, h + 2 * bw)
+            drawFill(tex2, st2, x - bw, y - bw, w + 2 * bw, h + 2 * bw, aspect2, rot, mirrorB, false, false)
+            curSolid = 0
+            setRect(x, y, w, h)
             drawFill(tex2, st2, x, y, w, h, aspect2, rot, mirrorB, false, false)
+            curMask = 0
         }
     }
 
@@ -886,6 +907,10 @@ class MainActivity : Activity() {
     private val shotShort = listOf("обычное", "брекетинг", "HDR", "ночь", "длинная ×16", "длинная ×32", "фокус-брекетинг")
     private var shotMode = 0
     private var dualMode = 0
+    private var pipShape = 0
+    private var pipCorner = 0
+    private val pipShapes = arrayOf("Прямоугольник", "Скруглённый", "Круг", "Квадрат", "Ромб", "Сердце")
+    private val pipCorners = arrayOf("вверху справа", "вверху слева", "внизу справа", "внизу слева")
     @Volatile private var slowFps = 0
     private var slowSize: Size? = null
     private var anamorph = 1f
@@ -1120,6 +1145,10 @@ class MainActivity : Activity() {
         geoOn = prefs.getBoolean("geo", false)
         dualMode = prefs.getInt("dual", 0).coerceIn(0, 2)
         gl.dual = dualMode
+        pipShape = prefs.getInt("pipShape", 0).coerceIn(0, 5)
+        pipCorner = prefs.getInt("pipCorner", 0).coerceIn(0, 3)
+        gl.pipShape = pipShape
+        gl.pipCorner = pipCorner
         anamorph = prefs.getFloat("anam", 1f)
         gl.desq = anamorph
         bg.post { loadSavedLut() }
@@ -3551,10 +3580,14 @@ class MainActivity : Activity() {
     // ----- две камеры -----
 
     private fun pickDual() {
-        if (recording) { setStatus("Режим двух камер меняется до записи", 2000); return }
         val names = arrayOf("Выкл", "Окно — вторая камера в углу", "Пополам")
+        val items = names.mapIndexed { i, n -> (if (i == dualMode) "✓ " else "") + n } +
+            listOf("Форма окна: " + pipShapes[pipShape].lowercase(), "Угол окна: " + pipCorners[pipCorner])
         AlertDialog.Builder(this, DIALOG).setTitle("Две камеры")
-            .setItems(names.mapIndexed { i, n -> (if (i == dualMode) "✓ " else "") + n }.toTypedArray()) { _, i ->
+            .setItems(items.toTypedArray()) { _, i ->
+                if (i == 3) { pickPipShape(); return@setItems }
+                if (i == 4) { pickPipCorner(); return@setItems }
+                if (recording) { setStatus("Режим двух камер меняется до записи", 2000); return@setItems }
                 dualMode = i
                 gl.dual = i
                 dualFailed = false
@@ -3569,6 +3602,54 @@ class MainActivity : Activity() {
                     restartPreview()
                 }
             }.show()
+    }
+
+    private fun pickPipShape() {
+        AlertDialog.Builder(this, DIALOG).setTitle("Форма окна")
+            .setItems(pipShapes.mapIndexed { i, n -> (if (i == pipShape) "✓ " else "") + n }.toTypedArray()) { _, i ->
+                pipShape = i
+                gl.pipShape = i
+                prefs.edit().putInt("pipShape", i).apply()
+                setStatus(if (dualMode == 1) "Окно: " + pipShapes[i].lowercase() else "Форма видна в режиме «Окно»", 1500)
+            }.show()
+    }
+
+    private fun pickPipCorner() {
+        AlertDialog.Builder(this, DIALOG).setTitle("Угол окна")
+            .setItems(pipCorners.mapIndexed { i, n -> (if (i == pipCorner) "✓ " else "") + n }.toTypedArray()) { _, i ->
+                pipCorner = i
+                gl.pipCorner = i
+                prefs.edit().putInt("pipCorner", i).apply()
+                setStatus("Окно " + pipCorners[i], 1200)
+            }.show()
+    }
+
+    /** Форма окна второй камеры для общего фото (как в видео). */
+    private fun shapePath(r: RectF): Path {
+        val p = Path()
+        val cx = r.centerX()
+        val cy = r.centerY()
+        val w = r.width()
+        val h = r.height()
+        when (pipShape) {
+            1 -> p.addRoundRect(r, 0.1f * min(w, h), 0.1f * min(w, h), Path.Direction.CW)
+            2 -> p.addCircle(cx, cy, min(w, h) / 2f, Path.Direction.CW)
+            4 -> { p.moveTo(cx, r.top); p.lineTo(r.right, cy); p.lineTo(cx, r.bottom); p.lineTo(r.left, cy); p.close() }
+            5 -> {
+                for (k in 0..96) {
+                    val t = k / 96.0 * 2.0 * Math.PI
+                    val s = sin(t)
+                    val hx = 16.0 * s * s * s
+                    val hy = 13.0 * cos(t) - 5.0 * cos(2 * t) - 2.0 * cos(3 * t) - cos(4 * t)
+                    val px = cx + (hx / 16.0 * w / 2.0 * 0.98).toFloat()
+                    val py = r.top + ((12.5 - hy) / 30.0 * h).toFloat()
+                    if (k == 0) p.moveTo(px, py) else p.lineTo(px, py)
+                }
+                p.close()
+            }
+            else -> p.addRect(r, Path.Direction.CW)
+        }
+        return p
     }
 
     /** Вторая камера: для задней — фронталка, для фронталки — основная задняя. */
@@ -3781,15 +3862,21 @@ class MainActivity : Activity() {
             cv.drawBitmap(first, 0f, 0f, p)
             val ba = second.width.toFloat() / second.height
             val short = 0.32f * min(w, h)
-            val bw: Int
-            val bh: Int
+            var bw: Int
+            var bh: Int
             if (ba < 1f) { bw = short.toInt(); bh = (short / ba).toInt() } else { bh = short.toInt(); bw = (short * ba).toInt() }
+            if (pipShape >= 2) { bw = (short * 1.15f).toInt(); bh = bw }
             val m = (0.035f * min(w, h)).toInt()
-            val x = w - bw - m
-            val y = m
+            val x = if (pipCorner % 2 == 0) w - bw - m else m
+            val y = if (pipCorner < 2) m else h - bh - m
             val bd = max(3, min(w, h) / 200)
-            cv.drawRect(Rect(x - bd, y - bd, x + bw + bd, y + bh + bd), Paint().apply { color = Color.WHITE })
-            cv.drawBitmap(second, null, Rect(x, y, x + bw, y + bh), p)
+            val outer = RectF((x - bd).toFloat(), (y - bd).toFloat(), (x + bw + bd).toFloat(), (y + bh + bd).toFloat())
+            val inner = RectF(x.toFloat(), y.toFloat(), (x + bw).toFloat(), (y + bh).toFloat())
+            cv.drawPath(shapePath(outer), Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE })
+            cv.save()
+            cv.clipPath(shapePath(inner))
+            cv.drawBitmap(second, cropRect(second, bw.toFloat() / bh), Rect(x, y, x + bw, y + bh), p)
+            cv.restore()
         }
         return out
     }
