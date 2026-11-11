@@ -14,6 +14,7 @@ import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.BitmapShader
 import android.graphics.Canvas
 import android.graphics.Color
@@ -41,6 +42,9 @@ import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.ExifInterface
@@ -89,6 +93,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -667,6 +672,7 @@ class MainActivity : Activity() {
     private lateinit var focusBar: SeekBar
     private lateinit var lockOverlay: TextView
     private lateinit var formatChip: TextView
+    private lateinit var shotChip: TextView
     private lateinit var settingsBtn: TextView
     private lateinit var wheel: ZoomWheel
     private lateinit var lensBar: LinearLayout
@@ -736,6 +742,34 @@ class MainActivity : Activity() {
     private var rawImage: Image? = null
     @Volatile private var rawOrient = 0
     private var lastMime = "video/*"
+    private val shotModes = listOf(
+        "Обычное фото", "Брекетинг −2 / 0 / +2 EV", "HDR (склейка 3 кадров)", "Ночь (8 кадров)",
+        "Длинная выдержка (16 кадров)", "Длинная выдержка (32 кадра)", "Брекетинг фокуса (8 кадров)"
+    )
+    private val shotShort = listOf("обычное", "брекетинг", "HDR", "ночь", "длинная ×16", "длинная ×32", "фокус-брекетинг")
+    private var shotMode = 0
+    @Volatile private var job: ShotJob? = null
+    @Volatile private var bursting = false
+    @Volatile private var burstCount = 0
+    private var shutterDown = false
+    private var geoOn = false
+    @Volatile private var lastLoc: Location? = null
+    private val locListener = LocationListener { l -> lastLoc = l }
+
+    /** Состояние многокадровой съёмки. */
+    private inner class ShotJob(val kind: Int, val total: Int) {
+        var got = 0
+        var count = 0
+        val frames = mutableListOf<Bitmap>()
+        var acc: ShortArray? = null
+        var w = 0
+        var h = 0
+        var ref16: IntArray? = null
+        var ref4: IntArray? = null
+        var savedFocus: Float? = null
+        var aeExp = 10_000_000L
+        var aeIso = 100
+    }
     private var intervalSec = 0
     private var seriesOn = false
     private val markers = mutableListOf<Long>()
@@ -776,6 +810,14 @@ class MainActivity : Activity() {
     private lateinit var orient: OrientationEventListener
     private val hideStatus = Runnable { statusText.visibility = View.GONE }
     private val lensRefresh = Runnable { renderLenses() }
+    private val burstStart = Runnable {
+        if (shutterDown && photoMode && job == null && !seriesOn) {
+            bursting = true
+            burstCount = 0
+            setStatus("Серия…", 800)
+            bg.post { burstNext() }
+        }
+    }
     private val dimTask = Runnable { if (recording && dimOnRec) setDim(true) }
     private val seriesTask = object : Runnable {
         override fun run() {
@@ -790,7 +832,7 @@ class MainActivity : Activity() {
             if (countLeft <= 0) {
                 counting = false
                 countText.visibility = View.GONE
-                if (photoMode) takePhoto() else bg.post { startRec() }
+                if (photoMode) shoot() else bg.post { startRec() }
                 return
             }
             countText.text = countLeft.toString()
@@ -908,6 +950,8 @@ class MainActivity : Activity() {
         intervalSec = prefs.getInt("interval", 0)
         photoMode = prefs.getBoolean("photoMode", false)
         rawOn = prefs.getBoolean("raw", false)
+        shotMode = prefs.getInt("shotMode", 0).coerceIn(0, 6)
+        geoOn = prefs.getBoolean("geo", false)
         applyModeUi()
         orient = object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
@@ -923,6 +967,15 @@ class MainActivity : Activity() {
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        if (requestCode == 2) {
+            if (grantResults.any { it == PackageManager.PERMISSION_GRANTED }) {
+                geoOn = true
+                prefs.edit().putBoolean("geo", true).apply()
+                startLoc()
+                setStatus("Геометки включены", 1500)
+            } else setStatus("Без доступа к местоположению геометки не работают", 2500)
+            return
+        }
         if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) init()
         else setStatus("Нужны разрешения на камеру и микрофон", 10000)
     }
@@ -931,6 +984,7 @@ class MainActivity : Activity() {
         super.onResume()
         resumed = true
         orient.enable()
+        startLoc()
         applyLevel()
         applyAnalysis()
         if (cams.isNotEmpty() && texture.isAvailable) restartPreview()
@@ -942,6 +996,8 @@ class MainActivity : Activity() {
         seriesOn = false
         main.removeCallbacks(seriesTask)
         orient.disable()
+        stopLoc()
+        bursting = false
         sensors.unregisterListener(levelListener)
         main.removeCallbacks(analyze)
         bg.removeCallbacks(restartTask)
@@ -1086,9 +1142,10 @@ class MainActivity : Activity() {
         timerChip = chip().apply { setOnClickListener { cycleTimer() } }
         focusChip = chip().apply { setOnClickListener { toggleFocusPanel() } }
         formatChip = chip().apply { visibility = View.GONE; setOnClickListener { toggleRaw() } }
+        shotChip = chip().apply { visibility = View.GONE; setOnClickListener { pickShotMode() } }
         starChip = chip().apply { text = "★ Метка"; setTextColor(YELLOW); visibility = View.GONE; setOnClickListener { addMarker() } }
         settingsBtn = chip().apply { text = "⚙"; textSize = 17f; setOnClickListener { showSettings() } }
-        listOf(starChip, resChip, formatChip, fpsChip, focusChip, isoChip, shutterChip, wbChip, evChip, profileChip, stabChip, horizonChip, timerChip, torchChip, settingsBtn)
+        listOf(starChip, shotChip, resChip, formatChip, fpsChip, focusChip, isoChip, shutterChip, wbChip, evChip, profileChip, stabChip, horizonChip, timerChip, torchChip, settingsBtn)
             .forEachIndexed { i, v -> row.addView(v, lp(WRAP, WRAP).apply { if (i > 0) leftMargin = dp(8) }) }
         val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
         scroll.addView(row, FrameLayout.LayoutParams(WRAP, MATCH))
@@ -1177,6 +1234,29 @@ class MainActivity : Activity() {
             background = GradientDrawable().apply { cornerRadius = dp(30).toFloat(); setColor(RED) }
         }
         recOuter.addView(recInner, FrameLayout.LayoutParams(dp(60), dp(60), Gravity.CENTER))
+        // удержание затвора в режиме фото — серийная съёмка
+        recOuter.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    shutterDown = true
+                    if (photoMode) main.postDelayed(burstStart, 450)
+                }
+                MotionEvent.ACTION_UP -> {
+                    shutterDown = false
+                    main.removeCallbacks(burstStart)
+                    if (bursting) {
+                        bursting = false
+                        setStatus("Серия: " + burstCount + " кадров", 2000)
+                    } else v.performClick()
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    shutterDown = false
+                    main.removeCallbacks(burstStart)
+                    bursting = false
+                }
+            }
+            true
+        }
         recRow.addView(leftSlot, lp(dp(54), dp(54)))
         recRow.addView(recOuter, lp(dp(78), dp(78)).apply { leftMargin = dp(40); rightMargin = dp(40) })
         recRow.addView(photoBtn, lp(dp(54), dp(54)))
@@ -1350,6 +1430,8 @@ class MainActivity : Activity() {
         tlBadge.visibility = if (tlIndex > 0 && !photoMode) View.VISIBLE else View.GONE
         formatChip.text = if (rawOn) "RAW+JPEG" else "JPEG"
         formatChip.setTextColor(if (rawOn) YELLOW else Color.WHITE)
+        shotChip.text = "Режим: " + shotShort[shotMode]
+        shotChip.setTextColor(if (shotMode != 0) YELLOW else Color.WHITE)
         profileChip.text = "Цвет: " + profileShort[profile]
         profileChip.setTextColor(if (profile != 0) YELLOW else Color.WHITE)
         horizonChip.setTextColor(if (horizonLock) YELLOW else Color.WHITE)
@@ -1849,6 +1931,7 @@ class MainActivity : Activity() {
         val v = if (photoMode) View.GONE else View.VISIBLE
         listOf<View>(fpsChip, profileChip, horizonChip).forEach { it.visibility = v }
         formatChip.visibility = if (photoMode) View.VISIBLE else View.GONE
+        shotChip.visibility = if (photoMode) View.VISIBLE else View.GONE
         photoBtn.text = if (photoMode) "🎥" else "📷"
         (recInner.background as GradientDrawable).setColor(if (photoMode) Color.WHITE else RED)
         updateChips()
@@ -2107,6 +2190,7 @@ class MainActivity : Activity() {
             "Отчёт о камере",
             "Выбрать камеру вручную",
             "Зеркальное видео с фронталки: " + onOff(mirrorFront),
+            "Геометки в фото и видео: " + onOff(geoOn),
             "Жесты и быстрый запуск"
         )
         AlertDialog.Builder(this, DIALOG).setTitle("Настройки")
@@ -2148,6 +2232,7 @@ class MainActivity : Activity() {
                         prefs.edit().putBoolean("mirrorFront", mirrorFront).apply()
                         setStatus(if (mirrorFront) "Видео с фронталки — зеркальное, как в зеркале" else "Видео с фронталки — как в жизни, текст читается", 2500)
                     }
+                    23 -> toggleGeo()
                     else -> AlertDialog.Builder(this, DIALOG).setTitle("Жесты и быстрый запуск")
                         .setMessage("Тап — фокус и замер света по точке\nДолгий тап — зафиксировать фокус и экспозицию\nДвойной тап — сброс на авто\nДва пальца или колесо — зум\nКнопка громкости — старт/стоп записи\n📷 — фото, в том числе во время записи\n★ — метка во время записи (сохраняются в Documents/WideCam)\nОбъективы и фронталку можно переключать во время записи\n\nБыстрый запуск: опусти шторку → карандаш (изменить) → перетащи плитку «Ширик-камера».")
                         .setPositiveButton("OK", null).show()
@@ -2653,6 +2738,8 @@ class MainActivity : Activity() {
             r.setAudioSamplingRate(48000)
             r.setAudioEncodingBitRate(192_000)
         }
+        val loc = lastLoc
+        if (geoOn && loc != null) r.setLocation(loc.latitude.toFloat(), loc.longitude.toFloat())
         return r
     }
 
@@ -2766,27 +2853,484 @@ class MainActivity : Activity() {
 
     private fun savePhoto(rd: ImageReader) {
         val img = try { rd.acquireLatestImage() } catch (e: Exception) { null } ?: return
-        try {
-            val w = img.width
-            val h = img.height
+        val bytes = try {
             val buf = img.planes[0].buffer
-            val bytes = ByteArray(buf.remaining())
-            buf.get(bytes)
-            val name = "WideCam_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + ".jpg"
-            val v = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, name)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/WideCam")
-            }
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)
-            if (uri != null) contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-            if (uri != null) { lastVideo = uri; lastMime = "image/jpeg"; loadThumb(uri) }
-            setStatus("Фото сохранено · " + w + "×" + h, 2000)
+            ByteArray(buf.remaining()).also { buf.get(it) }
+        } catch (e: Exception) { null } finally { img.close() }
+        if (bytes == null) return
+        val j = job
+        if (j != null) { onJobFrame(j, bytes); return }
+        if (bursting) {
+            saveJpegBytes(bytes, "_burst")
+            burstCount++
+            setStatus("Серия: " + burstCount, 800)
+            bg.post { burstNext() }
+            return
+        }
+        if (photoMode && profile != 0) {
+            try {
+                val b = decodeUpright(bytes)
+                if (b != null) {
+                    applyProfile(b, profile)
+                    saveBitmap(b, "")
+                    b.recycle()
+                    setStatus("Фото сохранено", 1500)
+                    return
+                }
+            } catch (e: OutOfMemoryError) {}
+        }
+        saveJpegBytes(bytes, "")
+        setStatus("Фото сохранено", 1500)
+    }
+
+    private fun newImageUri(suffix: String): Uri? {
+        val name = "WideCam_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + suffix + ".jpg"
+        val v = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/WideCam")
+        }
+        return contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)
+    }
+
+    private fun afterSave(uri: Uri) {
+        geotag(uri)
+        lastVideo = uri
+        lastMime = "image/jpeg"
+        loadThumb(uri)
+    }
+
+    private fun saveJpegBytes(bytes: ByteArray, suffix: String) {
+        try {
+            val uri = newImageUri(suffix) ?: return
+            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+            afterSave(uri)
         } catch (e: Exception) {
             setStatus("Фото не сохранилось: " + e.message)
-        } finally {
-            img.close()
         }
+    }
+
+    private fun saveBitmap(b: Bitmap, suffix: String) {
+        try {
+            val uri = newImageUri(suffix) ?: return
+            contentResolver.openOutputStream(uri)?.use { b.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+            afterSave(uri)
+        } catch (e: Exception) {
+            setStatus("Фото не сохранилось: " + e.message)
+        }
+    }
+
+    private fun geotag(uri: Uri) {
+        val loc = lastLoc ?: return
+        if (!geoOn) return
+        try {
+            contentResolver.openFileDescriptor(uri, "rw")?.use { fd ->
+                val ex = ExifInterface(fd.fileDescriptor)
+                ex.setLatLong(loc.latitude, loc.longitude)
+                if (loc.hasAltitude()) ex.setAltitude(loc.altitude)
+                ex.saveAttributes()
+            }
+        } catch (_: Exception) {}
+    }
+
+    /** JPEG → картинка, повёрнутая по EXIF, чтобы после обработки ориентация не потерялась. */
+    private fun decodeUpright(bytes: ByteArray): Bitmap? {
+        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        val o = try {
+            ExifInterface(ByteArrayInputStream(bytes)).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+        } catch (e: Exception) { ExifInterface.ORIENTATION_NORMAL }
+        val deg = when (o) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+            else -> 0f
+        }
+        val src = if (bmp.isMutable) bmp else bmp.copy(Bitmap.Config.ARGB_8888, true).also { bmp.recycle() }
+        if (deg == 0f) return src
+        val m = android.graphics.Matrix()
+        m.postRotate(deg)
+        val r = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
+        if (r !== src) src.recycle()
+        return if (r.isMutable) r else r.copy(Bitmap.Config.ARGB_8888, true).also { r.recycle() }
+    }
+
+    /** Цветовой профиль для фото — та же формула, что в видео. */
+    private fun applyProfile(b: Bitmap, prof: Int) {
+        if (prof == 0) return
+        val w = b.width
+        val row = IntArray(w)
+        for (y in 0 until b.height) {
+            b.getPixels(row, 0, w, 0, y, w, 1)
+            for (x in 0 until w) row[x] = profPixel(row[x], prof)
+            b.setPixels(row, 0, w, 0, y, w, 1)
+        }
+    }
+
+    private fun profPixel(p: Int, prof: Int): Int {
+        var r = ((p shr 16) and 255) / 255f
+        var g = ((p shr 8) and 255) / 255f
+        var bl = (p and 255) / 255f
+        fun luma() = 0.299f * r + 0.587f * g + 0.114f * bl
+        fun sat(s: Float) { val l = luma(); r = l + (r - l) * s; g = l + (g - l) * s; bl = l + (bl - l) * s }
+        fun con(k: Float) { r = (r - 0.5f) * k + 0.5f; g = (g - 0.5f) * k + 0.5f; bl = (bl - 0.5f) * k + 0.5f }
+        when (prof) {
+            1 -> { con(0.78f); r += 0.03f; g += 0.03f; bl += 0.03f; sat(0.8f) }
+            2 -> { sat(0.85f); con(1.12f); val d = (luma() - 0.5f) * 2f; r += 0.05f * d; bl -= 0.05f * d }
+            3 -> { sat(1.3f); con(1.08f) }
+            4 -> { val l = luma(); r = l; g = l; bl = l; con(1.15f) }
+        }
+        val ri = (r.coerceIn(0f, 1f) * 255).toInt()
+        val gi = (g.coerceIn(0f, 1f) * 255).toInt()
+        val bi = (bl.coerceIn(0f, 1f) * 255).toInt()
+        return (0xFF shl 24) or (ri shl 16) or (gi shl 8) or bi
+    }
+
+    // ----- многокадровые режимы -----
+
+    private fun pickShotMode() {
+        AlertDialog.Builder(this, DIALOG).setTitle("Режим фото")
+            .setItems(shotModes.mapIndexed { i, n -> (if (i == shotMode) "✓ " else "") + n }.toTypedArray()) { _, i ->
+                shotMode = i
+                prefs.edit().putInt("shotMode", i).apply()
+                updateChips()
+                val hint = when (i) {
+                    1 -> "3 снимка с разной яркостью — для сложного света"
+                    2 -> "3 снимка склеиваются в один: видно и небо, и тени"
+                    3 -> "8 снимков складываются — меньше шума. Держи телефон неподвижно"
+                    4, 5 -> "Кадры усредняются: вода — шёлк, движение — шлейф. Лучше со штатива или опоры"
+                    6 -> "Фокус от точки A к точке B (по умолчанию — от ближнего к бесконечности). Склеивать в Helicon / Photoshop"
+                    else -> "Обычное фото"
+                }
+                setStatus(hint, 4000)
+            }.show()
+    }
+
+    private fun shoot() {
+        if (shotMode == 0) takePhoto() else startShotJob()
+    }
+
+    private fun startShotJob() {
+        if (job != null) { setStatus("Подожди — идёт съёмка или обработка", 1500); return }
+        val c = curCam?.chars ?: return
+        val kind = shotMode
+        val n = when (kind) { 1, 2 -> 3; 3 -> 8; 4 -> 16; 5 -> 32; else -> 8 }
+        if (kind == 6 && !canFocus(c)) { setStatus("Брекетинг фокуса — только на объективе с автофокусом (1×)", 3000); return }
+        if ((kind == 1 || kind == 2) && !manualOk(c)) { setStatus("Для брекетинга нужна ручная экспозиция — у этого объектива её нет", 3000); return }
+        val j = ShotJob(kind, n)
+        j.aeExp = if (lastExp > 0) lastExp else 10_000_000L
+        j.aeIso = lastIso
+        j.savedFocus = manFocus
+        flashView.animate().cancel()
+        flashView.alpha = 0.5f
+        flashView.animate().alpha(0f).setDuration(250).start()
+        setStatus(shotModes[kind] + ": кадр 1/" + n + (if (kind in 3..5) " — не двигай телефон" else ""), 60000)
+        bg.post { job = j; captureNext(j) }
+    }
+
+    private fun captureNext(j: ShotJob) {
+        val s = session
+        val d = device
+        val cfg = activeCfg
+        val jr = photoReader
+        if (s == null || d == null || cfg == null || jr == null || !photoReady) {
+            finishJob(j, "Съёмка прервана — камера не готова")
+            return
+        }
+        val i = j.got
+        if (j.kind == 6) {
+            val a = focusA ?: minFocus()
+            val bb = focusB ?: 0f
+            manFocus = a + (bb - a) * i / max(1, j.total - 1)
+            applyControls(false)
+        }
+        val shot = Runnable {
+            try {
+                val b = d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                activeTargets.forEach { b.addTarget(it) }
+                b.addTarget(jr.surface)
+                fill(b, cfg)
+                b.set(CaptureRequest.JPEG_ORIENTATION, orientationFor(cfg))
+                b.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+                if (j.kind == 1 || j.kind == 2) {
+                    val ev = floatArrayOf(-2f, 0f, 2f)[i.coerceIn(0, 2)]
+                    var ex = (j.aeExp * Math.pow(2.0, ev.toDouble())).toLong()
+                    cfg.cam.chars[CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE]?.let { ex = ex.coerceIn(it.lower, it.upper) }
+                    b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                    b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, ex)
+                    b.set(CaptureRequest.SENSOR_SENSITIVITY, j.aeIso)
+                    b.set(CaptureRequest.SENSOR_FRAME_DURATION, max(ex, 33_333_333L))
+                }
+                s.capture(b.build(), null, bg)
+            } catch (e: Exception) {
+                finishJob(j, "Съёмка прервана: " + e.message)
+            }
+        }
+        if (j.kind == 6) bg.postDelayed(shot, 350) else bg.post(shot)
+    }
+
+    private fun onJobFrame(j: ShotJob, bytes: ByteArray) {
+        try {
+            when (j.kind) {
+                1 -> saveJpegBytes(bytes, "_ev" + arrayOf("-2", "0", "+2")[j.got.coerceIn(0, 2)])
+                6 -> saveJpegBytes(bytes, "_focus" + (j.got + 1))
+                2 -> decodeUpright(bytes)?.let { j.frames += it }
+                else -> decodeUpright(bytes)?.let { accumulate(j, it); it.recycle() }
+            }
+        } catch (e: OutOfMemoryError) {
+            finishJob(j, "Не хватило памяти — уменьши размер фото")
+            return
+        } catch (_: Exception) {}
+        j.got++
+        if (j.got < j.total) {
+            setStatus(shotModes[j.kind] + ": кадр " + (j.got + 1) + "/" + j.total, 60000)
+            captureNext(j)
+        } else {
+            setStatus(shotModes[j.kind] + ": обработка…", 60000)
+            finishJob(j, null)
+        }
+    }
+
+    private fun finishJob(j: ShotJob, err: String?) {
+        job = null
+        if (j.kind == 6) { manFocus = j.savedFocus; applyControls(false) }
+        if (err != null) {
+            j.frames.forEach { it.recycle() }
+            j.acc = null
+            setStatus(err, 4000)
+            return
+        }
+        try {
+            when (j.kind) {
+                1 -> setStatus("Брекетинг: сохранено 3 кадра", 2500)
+                6 -> setStatus("Брекетинг фокуса: сохранено " + j.total + " кадров", 3000)
+                2 -> {
+                    val out = hdrMerge(j.frames)
+                    j.frames.forEach { it.recycle() }
+                    j.frames.clear()
+                    if (out != null) {
+                        applyProfile(out, profile)
+                        saveBitmap(out, "_HDR")
+                        out.recycle()
+                        setStatus("HDR сохранён", 2500)
+                    } else setStatus("HDR не получился — кадры разного размера", 3000)
+                }
+                else -> {
+                    val out = averageOut(j)
+                    j.acc = null
+                    if (out != null) {
+                        applyProfile(out, profile)
+                        saveBitmap(out, if (j.kind == 3) "_NIGHT" else "_LONG")
+                        out.recycle()
+                        setStatus(if (j.kind == 3) "Ночное фото сохранено" else "Длинная выдержка сохранена", 2500)
+                    }
+                }
+            }
+        } catch (e: OutOfMemoryError) {
+            j.acc = null
+            setStatus("Не хватило памяти — уменьши размер фото", 4000)
+        } catch (e: Exception) {
+            setStatus("Обработка не удалась: " + e.message, 4000)
+        }
+    }
+
+    private fun lumaOf(b: Bitmap, f: Int): Triple<IntArray, Int, Int> {
+        val w = max(1, b.width / f)
+        val h = max(1, b.height / f)
+        val s = if (f == 1) b else Bitmap.createScaledBitmap(b, w, h, true)
+        val px = IntArray(w * h)
+        s.getPixels(px, 0, w, 0, 0, w, h)
+        if (s !== b) s.recycle()
+        for (i in px.indices) {
+            val c = px[i]
+            px[i] = (((c shr 16) and 255) * 3 + ((c shr 8) and 255) * 6 + (c and 255)) / 10
+        }
+        return Triple(px, w, h)
+    }
+
+    private fun norm(a: IntArray): IntArray {
+        val m = max(1.0, a.average())
+        val k = 128.0 / m
+        return IntArray(a.size) { (a[it] * k).toInt() }
+    }
+
+    /** Ищем сдвиг, при котором кадр лучше всего совпадает с опорным. */
+    private fun bestShift(ref: IntArray, cur: IntArray, w: Int, h: Int, cx: Int, cy: Int, r: Int, margin: Int): Pair<Int, Int> {
+        var best = Long.MAX_VALUE
+        var bx = cx
+        var by = cy
+        val step = max(1, min(w, h) / 120)
+        for (dy in cy - r..cy + r) for (dx in cx - r..cx + r) {
+            var s = 0L
+            var y = margin
+            while (y < h - margin) {
+                val yy = y + dy
+                if (yy in 0 until h) {
+                    var x = margin
+                    while (x < w - margin) {
+                        val xx = x + dx
+                        if (xx in 0 until w) s += abs(ref[y * w + x] - cur[yy * w + xx])
+                        x += step
+                    }
+                }
+                y += step
+            }
+            if (s < best) { best = s; bx = dx; by = dy }
+        }
+        return Pair(bx, by)
+    }
+
+    private fun alignTo(base: Bitmap, cur: Bitmap): Pair<Int, Int> {
+        val (r16, w16, h16) = lumaOf(base, 16)
+        val (c16, _, _) = lumaOf(cur, 16)
+        val (r4, w4, h4) = lumaOf(base, 4)
+        val (c4, _, _) = lumaOf(cur, 4)
+        val (cx, cy) = bestShift(norm(r16), norm(c16), w16, h16, 0, 0, 6, 8)
+        val (fx, fy) = bestShift(norm(r4), norm(c4), w4, h4, cx * 4, cy * 4, 4, 30)
+        return Pair(fx * 4, fy * 4)
+    }
+
+    private fun alignOffset(j: ShotJob, bmp: Bitmap): Pair<Int, Int> {
+        val (s16, w16, h16) = lumaOf(bmp, 16)
+        val (s4, w4, h4) = lumaOf(bmp, 4)
+        val n16 = norm(s16)
+        val n4 = norm(s4)
+        val r16 = j.ref16
+        val r4 = j.ref4
+        if (r16 == null || r4 == null || r16.size != n16.size || r4.size != n4.size) {
+            j.ref16 = n16; j.ref4 = n4
+            return Pair(0, 0)
+        }
+        val (cx, cy) = bestShift(r16, n16, w16, h16, 0, 0, 6, 8)
+        val (fx, fy) = bestShift(r4, n4, w4, h4, cx * 4, cy * 4, 4, 30)
+        return Pair(fx * 4, fy * 4)
+    }
+
+    private fun accumulate(j: ShotJob, bmp: Bitmap) {
+        val w = bmp.width
+        val h = bmp.height
+        if (j.acc == null) { j.w = w; j.h = h; j.acc = ShortArray(w * h * 3) }
+        if (w != j.w || h != j.h) return
+        val (dx, dy) = alignOffset(j, bmp)
+        val acc = j.acc ?: return
+        val row = IntArray(w)
+        for (y in 0 until h) {
+            bmp.getPixels(row, 0, w, 0, (y + dy).coerceIn(0, h - 1), w, 1)
+            var o = y * w * 3
+            for (x in 0 until w) {
+                val p = row[(x + dx).coerceIn(0, w - 1)]
+                acc[o] = (acc[o] + ((p shr 16) and 255)).toShort()
+                acc[o + 1] = (acc[o + 1] + ((p shr 8) and 255)).toShort()
+                acc[o + 2] = (acc[o + 2] + (p and 255)).toShort()
+                o += 3
+            }
+        }
+        j.count++
+    }
+
+    private fun averageOut(j: ShotJob): Bitmap? {
+        val acc = j.acc ?: return null
+        val n = max(1, j.count)
+        val out = Bitmap.createBitmap(j.w, j.h, Bitmap.Config.ARGB_8888)
+        val row = IntArray(j.w)
+        for (y in 0 until j.h) {
+            var o = y * j.w * 3
+            for (x in 0 until j.w) {
+                row[x] = (0xFF shl 24) or ((acc[o] / n) shl 16) or ((acc[o + 1] / n) shl 8) or (acc[o + 2] / n)
+                o += 3
+            }
+            out.setPixels(row, 0, j.w, 0, y, j.w, 1)
+        }
+        return out
+    }
+
+    /** HDR: склейка трёх экспозиций — у каждого пикселя больше веса у кадра, где он лучше проэкспонирован. */
+    private fun hdrMerge(fr: List<Bitmap>): Bitmap? {
+        if (fr.size < 3) return null
+        val base = fr[1]
+        val w = base.width
+        val h = base.height
+        if (fr.any { it.width != w || it.height != h }) return null
+        val sh = fr.map { if (it === base) Pair(0, 0) else alignTo(base, it) }
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val rows = Array(3) { IntArray(w) }
+        val o = IntArray(w)
+        for (y in 0 until h) {
+            for (k in 0..2) fr[k].getPixels(rows[k], 0, w, 0, (y + sh[k].second).coerceIn(0, h - 1), w, 1)
+            for (x in 0 until w) {
+                var sw = 0f; var sr = 0f; var sg = 0f; var sb = 0f
+                for (k in 0..2) {
+                    val p = rows[k][(x + sh[k].first).coerceIn(0, w - 1)]
+                    val r = (p shr 16) and 255
+                    val g = (p shr 8) and 255
+                    val b = p and 255
+                    val l = (r * 0.299f + g * 0.587f + b * 0.114f) / 255f - 0.5f
+                    val wt = exp(-l * l * 12.5f) + 0.001f
+                    sw += wt; sr += wt * r; sg += wt * g; sb += wt * b
+                }
+                o[x] = (0xFF shl 24) or ((sr / sw).toInt() shl 16) or ((sg / sw).toInt() shl 8) or (sb / sw).toInt()
+            }
+            out.setPixels(o, 0, w, 0, y, w, 1)
+        }
+        return out
+    }
+
+    private fun burstNext() {
+        if (!bursting) return
+        val s = session
+        val d = device
+        val cfg = activeCfg
+        val jr = photoReader
+        if (s == null || d == null || cfg == null || jr == null || !photoReady) { bursting = false; return }
+        try {
+            val b = d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            activeTargets.forEach { b.addTarget(it) }
+            b.addTarget(jr.surface)
+            fill(b, cfg)
+            b.set(CaptureRequest.JPEG_ORIENTATION, orientationFor(cfg))
+            b.set(CaptureRequest.JPEG_QUALITY, 90.toByte())
+            s.capture(b.build(), null, bg)
+        } catch (e: Exception) {
+            bursting = false
+        }
+    }
+
+    // ----- геометки -----
+
+    private fun toggleGeo() {
+        if (geoOn) {
+            geoOn = false
+            prefs.edit().putBoolean("geo", false).apply()
+            stopLoc()
+            setStatus("Геометки выключены", 1500)
+            return
+        }
+        val perms = arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+        if (perms.any { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
+            geoOn = true
+            prefs.edit().putBoolean("geo", true).apply()
+            startLoc()
+            setStatus("Геометки включены", 1500)
+        } else requestPermissions(perms, 2)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startLoc() {
+        if (!geoOn) return
+        val lm = getSystemService(LocationManager::class.java) ?: return
+        try {
+            for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)) {
+                val l = try { lm.getLastKnownLocation(p) } catch (e: Exception) { null }
+                val cur = lastLoc
+                if (l != null && (cur == null || l.time > cur.time)) lastLoc = l
+            }
+            for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+                if (lm.isProviderEnabled(p)) lm.requestLocationUpdates(p, 10_000L, 10f, locListener, Looper.getMainLooper())
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun stopLoc() {
+        try { getSystemService(LocationManager::class.java)?.removeUpdates(locListener) } catch (_: Exception) {}
     }
 
     // ---------- запись ----------
@@ -2802,7 +3346,7 @@ class MainActivity : Activity() {
         }
         if (photoMode && intervalSec > 0) { toggleSeries(); return }
         if (timerSec > 0) { counting = true; countLeft = timerSec; main.post(countTask) }
-        else if (photoMode) takePhoto() else bg.post { startRec() }
+        else if (photoMode) shoot() else bg.post { startRec() }
     }
 
     private fun startRec() {
