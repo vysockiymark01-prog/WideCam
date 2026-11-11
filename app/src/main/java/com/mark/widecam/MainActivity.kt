@@ -830,6 +830,24 @@ class MainActivity : Activity() {
     private var dualFailed = false
     @Volatile private var dev2: CameraDevice? = null
     @Volatile private var ses2: CameraCaptureSession? = null
+    @Volatile private var cam2: Cam? = null
+    private var photoReader2: ImageReader? = null
+    @Volatile private var photoReady2 = false
+    private var photo2Level = 0
+    @Volatile private var dualShot: DualShot? = null
+
+    private class DualShot {
+        var a: ByteArray? = null
+        var b: ByteArray? = null
+    }
+
+    private val dualTimeout = Runnable {
+        val ds = dualShot ?: return@Runnable
+        dualShot = null
+        ds.a?.let { saveJpegBytes(it, "") }
+        ds.b?.let { saveJpegBytes(it, "_B") }
+        setStatus("Вторая камера не успела — сохранил что есть", 2500)
+    }
     @Volatile private var job: ShotJob? = null
     @Volatile private var bursting = false
     @Volatile private var burstCount = 0
@@ -1304,7 +1322,8 @@ class MainActivity : Activity() {
                 shape = GradientDrawable.OVAL; setColor(0x55FFFFFF); setStroke(dp(2), Color.WHITE)
             }
             clipToOutline = true
-            setOnClickListener { openLast() }
+            setOnClickListener { if (!recording) startActivity(Intent(this@MainActivity, GalleryActivity::class.java)) }
+            setOnLongClickListener { openLast(); true }
         }
         pauseBtn = roundBtn("❚❚").apply { visibility = View.GONE; setOnClickListener { togglePause() } }
         leftSlot.addView(galleryBtn, FrameLayout.LayoutParams(MATCH, MATCH))
@@ -2011,13 +2030,14 @@ class MainActivity : Activity() {
         prefs.edit().putBoolean("photoMode", on).apply()
         if (on) gl.horizonDeg = 0f
         applyModeUi()
+        bg.post { closeSecond() }
         restartPreview()
         setStatus(if (on) "Режим фото" else "Режим видео", 1200)
     }
 
     private fun applyModeUi() {
         val v = if (photoMode) View.GONE else View.VISIBLE
-        listOf<View>(fpsChip, profileChip, horizonChip, dualChip).forEach { it.visibility = v }
+        listOf<View>(fpsChip, profileChip, horizonChip).forEach { it.visibility = v }
         formatChip.visibility = if (photoMode) View.VISIBLE else View.GONE
         shotChip.visibility = if (photoMode) View.VISIBLE else View.GONE
         photoBtn.text = if (photoMode) "🎥" else "📷"
@@ -2878,7 +2898,7 @@ class MainActivity : Activity() {
                     applyControls(afPoint != null && canFocus(cfg.cam.chars))
                     ui { updateReadout() }
                     gl.aspect1 = min(cfg.preview.width, cfg.preview.height).toFloat() / max(cfg.preview.width, cfg.preview.height)
-                    if (dualMode != 0 && !photoMode && dev2 == null && !dualFailed) openSecond(cfg)
+                    if (dualMode != 0 && dev2 == null && !dualFailed) openSecond(cfg)
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
@@ -2918,6 +2938,7 @@ class MainActivity : Activity() {
                 return@post
             }
             try {
+                if (photoMode && gl.has2 && photoReady2 && !recording) startDualSecond()
                 val b = d.createCaptureRequest(
                     if (recording) CameraDevice.TEMPLATE_VIDEO_SNAPSHOT else CameraDevice.TEMPLATE_STILL_CAPTURE
                 )
@@ -2951,6 +2972,8 @@ class MainActivity : Activity() {
         if (bytes == null) return
         val j = job
         if (j != null) { onJobFrame(j, bytes); return }
+        val ds = dualShot
+        if (ds != null && !bursting && ds.a == null) { ds.a = bytes; tryDual(); return }
         if (bursting) {
             saveJpegBytes(bytes, "_burst")
             burstCount++
@@ -3411,6 +3434,7 @@ class MainActivity : Activity() {
                 dualMode = i
                 gl.dual = i
                 dualFailed = false
+                photo2Level = 0
                 prefs.edit().putInt("dual", i).apply()
                 updateChips()
                 if (i == 0) {
@@ -3454,17 +3478,21 @@ class MainActivity : Activity() {
         try {
             mgr.openCamera(c2.openId, exec, object : CameraDevice.StateCallback() {
                 override fun onOpened(d: CameraDevice) {
-                    if (dualMode == 0 || photoMode) { d.close(); return }
+                    if (dualMode == 0) { d.close(); return }
                     dev2 = d
+                    cam2 = c2
                     val sz = secondSize(c2)
                     gl.camTexture2.setDefaultBufferSize(sz.width, sz.height)
                     gl.aspect2 = min(sz.width, sz.height).toFloat() / max(sz.width, sz.height)
                     gl.mirror2 = isFront(c2) && mirrorFront
-                    val outs = listOf(OutputConfiguration(cam2Surface).also { o -> c2.physicalId?.let { o.setPhysicalCameraId(it) } })
+                    val jr2 = if (photoMode) photoReader2For(c2) else null
+                    val outs = mutableListOf(OutputConfiguration(cam2Surface).also { o -> c2.physicalId?.let { o.setPhysicalCameraId(it) } })
+                    if (jr2 != null) outs += OutputConfiguration(jr2.surface).also { o -> c2.physicalId?.let { o.setPhysicalCameraId(it) } }
                     val sc = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outs, exec,
                         object : CameraCaptureSession.StateCallback() {
                             override fun onConfigured(s: CameraCaptureSession) {
                                 ses2 = s
+                                photoReady2 = jr2 != null
                                 try {
                                     val b = d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                                     b.addTarget(cam2Surface)
@@ -3479,7 +3507,13 @@ class MainActivity : Activity() {
                                     dualFail("второй поток не запустился")
                                 }
                             }
-                            override fun onConfigureFailed(s: CameraCaptureSession) { dualFail("драйвер не дал второй поток") }
+                            override fun onConfigureFailed(s: CameraCaptureSession) {
+                                if (jr2 != null) {
+                                    photo2Level++
+                                    closeSecond()
+                                    openSecond(cfg)
+                                } else dualFail("драйвер не дал второй поток")
+                            }
                         })
                     try { d.createCaptureSession(sc) } catch (e: Exception) { dualFail(e.message ?: "ошибка сессии") }
                 }
@@ -3506,10 +3540,134 @@ class MainActivity : Activity() {
 
     private fun closeSecond() {
         gl.has2 = false
+        photoReady2 = false
         try { ses2?.close() } catch (_: Exception) {}
         ses2 = null
         try { dev2?.close() } catch (_: Exception) {}
         dev2 = null
+    }
+
+    // ----- фото с двух камер -----
+
+    private fun photoReader2For(c2: Cam): ImageReader? {
+        if (photo2Level >= 2) return null
+        val jpegs = streamMap(c2)?.getOutputSizes(ImageFormat.JPEG)?.toList() ?: return null
+        val limit = if (photo2Level == 0) 12_600_000 else 1920 * 1440
+        val sz = jpegs.filter { it.width * it.height <= limit }.maxByOrNull { it.width * it.height } ?: return null
+        val cur = photoReader2
+        if (cur != null && cur.width == sz.width && cur.height == sz.height) return cur
+        try { cur?.close() } catch (_: Exception) {}
+        val r = ImageReader.newInstance(sz.width, sz.height, ImageFormat.JPEG, 2)
+        r.setOnImageAvailableListener({ rd -> onSecondJpeg(rd) }, bg)
+        photoReader2 = r
+        return r
+    }
+
+    private fun startDualSecond() {
+        val s2 = ses2
+        val d2 = dev2
+        val c2 = cam2
+        val r2 = photoReader2
+        if (s2 == null || d2 == null || c2 == null || r2 == null) return
+        try {
+            dualShot = DualShot()
+            val b = d2.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            b.addTarget(cam2Surface)
+            b.addTarget(r2.surface)
+            val sensor = c2.chars[CameraCharacteristics.SENSOR_ORIENTATION] ?: 270
+            val dv = if (isFront(c2)) -devOrient else devOrient
+            b.set(CaptureRequest.JPEG_ORIENTATION, (sensor + dv + 360) % 360)
+            b.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+            s2.capture(b.build(), null, bg)
+            bg.removeCallbacks(dualTimeout)
+            bg.postDelayed(dualTimeout, 4000)
+        } catch (e: Exception) {
+            dualShot = null
+        }
+    }
+
+    private fun onSecondJpeg(rd: ImageReader) {
+        val img = try { rd.acquireLatestImage() } catch (e: Exception) { null } ?: return
+        val bytes = try {
+            val buf = img.planes[0].buffer
+            ByteArray(buf.remaining()).also { buf.get(it) }
+        } catch (e: Exception) { null } finally { img.close() }
+        if (bytes == null) return
+        val ds = dualShot
+        if (ds == null) { saveJpegBytes(bytes, "_B"); return }
+        ds.b = bytes
+        tryDual()
+    }
+
+    private fun tryDual() {
+        val ds = dualShot ?: return
+        val a = ds.a ?: return
+        val b = ds.b ?: return
+        dualShot = null
+        bg.removeCallbacks(dualTimeout)
+        saveJpegBytes(a, "_A")
+        saveJpegBytes(b, "_B")
+        try {
+            val first = decodeUpright(a)
+            val second = decodeUpright(b)
+            if (first != null && second != null) {
+                val out = composeDual(first, second)
+                first.recycle()
+                second.recycle()
+                applyProfile(out, profile)
+                saveBitmap(out, "_DUAL")
+                out.recycle()
+                setStatus("Сохранено: общее фото и оба кадра отдельно", 2500)
+            }
+        } catch (e: OutOfMemoryError) {
+            setStatus("Не хватило памяти на склейку — оба кадра сохранены отдельно", 3000)
+        }
+    }
+
+    private fun cropRect(b: Bitmap, aspect: Float): Rect {
+        val w = b.width
+        val h = b.height
+        return if (w.toFloat() / h > aspect) {
+            val nw = (h * aspect).toInt()
+            Rect((w - nw) / 2, 0, (w - nw) / 2 + nw, h)
+        } else {
+            val nh = (w / aspect).toInt()
+            Rect(0, (h - nh) / 2, w, (h - nh) / 2 + nh)
+        }
+    }
+
+    /** Общее фото: как в видео — окном в углу или пополам. */
+    private fun composeDual(first: Bitmap, second: Bitmap): Bitmap {
+        val w = first.width
+        val h = first.height
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val cv = Canvas(out)
+        val p = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        if (dualMode == 2) {
+            if (w >= h) {
+                val hw = w / 2
+                cv.drawBitmap(first, cropRect(first, hw.toFloat() / h), Rect(0, 0, hw, h), p)
+                cv.drawBitmap(second, cropRect(second, (w - hw).toFloat() / h), Rect(hw, 0, w, h), p)
+            } else {
+                val hh = h / 2
+                cv.drawBitmap(first, cropRect(first, w.toFloat() / hh), Rect(0, 0, w, hh), p)
+                cv.drawBitmap(second, cropRect(second, w.toFloat() / (h - hh)), Rect(0, hh, w, h), p)
+            }
+        } else {
+            cv.drawBitmap(first, 0f, 0f, p)
+            val ba = second.width.toFloat() / second.height
+            val short = 0.32f * min(w, h)
+            val bw: Int
+            val bh: Int
+            if (ba < 1f) { bw = short.toInt(); bh = (short / ba).toInt() } else { bh = short.toInt(); bw = (short * ba).toInt() }
+            val m = (0.035f * min(w, h)).toInt()
+            val x = w - bw - m
+            val y = m
+            val bd = max(3, min(w, h) / 200)
+            cv.drawRect(Rect(x - bd, y - bd, x + bw + bd, y + bh + bd), Paint().apply { color = Color.WHITE })
+            cv.drawBitmap(second, null, Rect(x, y, x + bw, y + bh), p)
+        }
+        return out
     }
 
     // ----- геометки -----
@@ -3732,5 +3890,274 @@ class CamTile : TileService() {
             @Suppress("DEPRECATION")
             startActivityAndCollapse(i)
         }
+    }
+}
+
+/** Галерея снимков и видео WideCam: листать, смотреть, делиться, удалять. */
+class GalleryActivity : Activity() {
+    private data class Item(val uri: Uri, val video: Boolean, val name: String)
+
+    private val items = mutableListOf<Item>()
+    private val pool = java.util.concurrent.Executors.newFixedThreadPool(3)
+    private val main = Handler(Looper.getMainLooper())
+    private val thumbs = android.util.LruCache<Uri, Bitmap>(150)
+    private lateinit var grid: android.widget.GridView
+    private lateinit var adapter: android.widget.BaseAdapter
+    private lateinit var empty: TextView
+    private lateinit var viewer: FrameLayout
+    private lateinit var image: ImageView
+    private lateinit var video: android.widget.VideoView
+    private lateinit var title: TextView
+    private var pos = -1
+    private var pendingDelete: Item? = null
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun btn(t: String, f: () -> Unit) = TextView(this).apply {
+        text = t; setTextColor(Color.WHITE); textSize = 15f; typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER; setPadding(dp(14), dp(8), dp(14), dp(8))
+        background = GradientDrawable().apply { cornerRadius = dp(100).toFloat(); setColor(0x44FFFFFF) }
+        setOnClickListener { f() }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.statusBarColor = Color.BLACK
+        window.navigationBarColor = Color.BLACK
+        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        bar.addView(btn("✕") { finish() })
+        bar.addView(TextView(this).apply {
+            text = "Галерея"; setTextColor(Color.WHITE); textSize = 18f; typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(12), 0, 0, 0)
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        col.addView(bar)
+
+        val cell = resources.displayMetrics.widthPixels / 3
+        grid = android.widget.GridView(this).apply {
+            numColumns = 3
+            horizontalSpacing = dp(2)
+            verticalSpacing = dp(2)
+            stretchMode = android.widget.GridView.STRETCH_COLUMN_WIDTH
+        }
+        adapter = object : android.widget.BaseAdapter() {
+            override fun getCount() = items.size
+            override fun getItem(p: Int): Any = items[p]
+            override fun getItemId(p: Int) = p.toLong()
+            override fun getView(p: Int, convert: View?, parent: android.view.ViewGroup?): View {
+                val f = (convert as? FrameLayout) ?: FrameLayout(this@GalleryActivity).apply {
+                    layoutParams = android.widget.AbsListView.LayoutParams(cell, cell)
+                    addView(ImageView(this@GalleryActivity).apply {
+                        scaleType = ImageView.ScaleType.CENTER_CROP
+                        setBackgroundColor(0xFF222222.toInt())
+                    }, FrameLayout.LayoutParams(-1, -1))
+                    addView(TextView(this@GalleryActivity).apply {
+                        text = "▶"; setTextColor(Color.WHITE); textSize = 22f
+                        setShadowLayer(8f, 0f, 0f, Color.BLACK)
+                    }, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+                }
+                val iv = f.getChildAt(0) as ImageView
+                val item = items[p]
+                f.getChildAt(1).visibility = if (item.video) View.VISIBLE else View.GONE
+                iv.tag = item.uri
+                val cached = thumbs.get(item.uri)
+                if (cached != null) iv.setImageBitmap(cached) else {
+                    iv.setImageDrawable(null)
+                    pool.execute {
+                        val bm = try { contentResolver.loadThumbnail(item.uri, Size(300, 300), null) } catch (e: Exception) { null }
+                        if (bm != null) {
+                            thumbs.put(item.uri, bm)
+                            main.post { if (iv.tag == item.uri) iv.setImageBitmap(bm) }
+                        }
+                    }
+                }
+                return f
+            }
+        }
+        grid.adapter = adapter
+        grid.setOnItemClickListener { _, _, p, _ -> openViewer(p) }
+        col.addView(grid, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(col, FrameLayout.LayoutParams(-1, -1))
+
+        empty = TextView(this).apply {
+            text = "Пока нет снимков и видео"; setTextColor(0xAAFFFFFF.toInt()); textSize = 15f
+            visibility = View.GONE
+        }
+        root.addView(empty, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+
+        viewer = FrameLayout(this).apply { setBackgroundColor(Color.BLACK); visibility = View.GONE; isClickable = true }
+        image = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+        viewer.addView(image, FrameLayout.LayoutParams(-1, -1))
+        video = android.widget.VideoView(this).apply { visibility = View.GONE }
+        viewer.addView(video, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+        title = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = 13f
+            setPadding(dp(16), dp(14), dp(16), dp(14)); setBackgroundColor(0x88000000.toInt())
+        }
+        viewer.addView(title, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+        val vb = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER
+            setPadding(dp(8), dp(12), dp(8), dp(20)); setBackgroundColor(0x88000000.toInt())
+        }
+        listOf(
+            btn("◀") { step(-1) }, btn("Поделиться") { share() }, btn("Удалить") { askDelete() },
+            btn("▶") { step(1) }, btn("✕") { closeViewer() }
+        ).forEach { vb.addView(it, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(3); rightMargin = dp(3) }) }
+        viewer.addView(vb, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                if (abs(vx) > abs(vy) && abs(vx) > 800f) { step(if (vx < 0) 1 else -1); return true }
+                return false
+            }
+        })
+        image.setOnTouchListener { _, e -> gd.onTouchEvent(e); true }
+        root.addView(viewer, FrameLayout.LayoutParams(-1, -1))
+
+        setContentView(root)
+        load()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        pool.shutdownNow()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (viewer.visibility == View.VISIBLE) closeViewer() else super.onBackPressed()
+    }
+
+    private fun load() {
+        pool.execute {
+            val list = query()
+            main.post {
+                items.clear()
+                items.addAll(list)
+                adapter.notifyDataSetChanged()
+                empty.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+            }
+        }
+    }
+
+    private fun query(): List<Item> {
+        val out = mutableListOf<Pair<Item, Long>>()
+        fun q(base: Uri, path: String, isVideo: Boolean) {
+            try {
+                contentResolver.query(
+                    base,
+                    arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.DATE_ADDED),
+                    MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ?", arrayOf(path), null
+                )?.use { c ->
+                    while (c.moveToNext()) {
+                        out += Pair(Item(ContentUris.withAppendedId(base, c.getLong(0)), isVideo, c.getString(1) ?: ""), c.getLong(2))
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        q(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "Pictures/WideCam%", false)
+        q(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "Movies/WideCam%", true)
+        return out.sortedByDescending { it.second }.map { it.first }
+    }
+
+    private fun openViewer(p: Int) {
+        pos = p
+        viewer.visibility = View.VISIBLE
+        show()
+    }
+
+    private fun closeViewer() {
+        try { video.stopPlayback() } catch (_: Exception) {}
+        viewer.visibility = View.GONE
+        pos = -1
+    }
+
+    private fun step(d: Int) {
+        if (items.isEmpty() || pos < 0) return
+        pos = (pos + d).coerceIn(0, items.size - 1)
+        show()
+    }
+
+    private fun show() {
+        val item = items.getOrNull(pos)
+        if (item == null) { closeViewer(); return }
+        title.text = "" + (pos + 1) + " / " + items.size + "    " + item.name
+        try { video.stopPlayback() } catch (_: Exception) {}
+        if (item.video) {
+            image.visibility = View.GONE
+            video.visibility = View.VISIBLE
+            val mc = android.widget.MediaController(this)
+            mc.setAnchorView(video)
+            video.setMediaController(mc)
+            video.setVideoURI(item.uri)
+            video.start()
+        } else {
+            video.visibility = View.GONE
+            image.visibility = View.VISIBLE
+            image.setImageDrawable(null)
+            val u = item.uri
+            pool.execute {
+                val bm = try {
+                    android.graphics.ImageDecoder.decodeBitmap(android.graphics.ImageDecoder.createSource(contentResolver, u)) { dec, info, _ ->
+                        val s = max(info.size.width, info.size.height)
+                        dec.setTargetSampleSize(max(1, s / 2400))
+                    }
+                } catch (e: Exception) { null }
+                main.post { if (items.getOrNull(pos)?.uri == u) image.setImageBitmap(bm) }
+            }
+        }
+    }
+
+    private fun share() {
+        val item = items.getOrNull(pos) ?: return
+        val i = Intent(Intent.ACTION_SEND)
+            .setType(if (item.video) "video/*" else "image/*")
+            .putExtra(Intent.EXTRA_STREAM, item.uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        startActivity(Intent.createChooser(i, "Поделиться"))
+    }
+
+    private fun askDelete() {
+        val item = items.getOrNull(pos) ?: return
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Удалить?")
+            .setMessage(item.name)
+            .setPositiveButton("Удалить") { _, _ -> doDelete(item) }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun doDelete(item: Item) {
+        try {
+            contentResolver.delete(item.uri, null, null)
+            removed(item)
+        } catch (e: SecurityException) {
+            if (Build.VERSION.SDK_INT >= 30) {
+                pendingDelete = item
+                val pi = MediaStore.createDeleteRequest(contentResolver, listOf(item.uri))
+                startIntentSenderForResult(pi.intentSender, 7, null, 0, 0, 0)
+            }
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 7 && resultCode == RESULT_OK) pendingDelete?.let { removed(it) }
+        pendingDelete = null
+    }
+
+    private fun removed(item: Item) {
+        thumbs.remove(item.uri)
+        items.remove(item)
+        adapter.notifyDataSetChanged()
+        empty.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+        if (items.isEmpty()) { closeViewer(); return }
+        if (pos >= items.size) pos = items.size - 1
+        show()
     }
 }
